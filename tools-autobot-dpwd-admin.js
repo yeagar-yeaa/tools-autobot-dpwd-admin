@@ -136,7 +136,8 @@ function convertLegacyDepositAutoApproveTargetToLocks(value) {
   const normalized = String(value || "").toUpperCase().trim();
   const groups = getDepositAutoApproveGroupMap();
   if (groups[normalized]) return groups[normalized].slice();
-  return getDepositAutoApproveKnownKeys().slice();
+  if (normalized && normalized !== "ALL") return normalizeDepositAutoApproveLocks([normalized], { fallbackAll: false });
+  return [];
 }
 
 function loadDepositAutoApproveLocks() {
@@ -145,14 +146,14 @@ function loadDepositAutoApproveLocks() {
     if (raw) {
       try {
         const parsed = JSON.parse(raw);
-        return normalizeDepositAutoApproveLocks(parsed, { fallbackAll: true });
+        return normalizeDepositAutoApproveLocks(parsed, { fallbackAll: false });
       } catch (_) {
-        return normalizeDepositAutoApproveLocks(String(raw).split(","), { fallbackAll: true });
+        return normalizeDepositAutoApproveLocks(String(raw).split(","), { fallbackAll: false });
       }
     }
-    return normalizeDepositAutoApproveLocks(convertLegacyDepositAutoApproveTargetToLocks(localStorage.getItem(DEPO_AUTO_APPROVE_TARGET_KEY)), { fallbackAll: true });
+    return normalizeDepositAutoApproveLocks(convertLegacyDepositAutoApproveTargetToLocks(localStorage.getItem(DEPO_AUTO_APPROVE_TARGET_KEY)), { fallbackAll: false });
   } catch (_) {
-    return getDepositAutoApproveKnownKeys().slice();
+    return [];
   }
 }
 
@@ -343,6 +344,7 @@ function normalizeBankLabelKey(value) {
     mainBooted: false,
     menuCloseFns: { depo: null, wd: null, depoAutoApproveLock: null },
     drag: { active: false, startX: 0, startY: 0, left: 0, top: 0, pointerId: null },
+    lastEscShortcutAt: 0,
     depo: {
       showAll: true,
       sortBy: "date",
@@ -386,7 +388,7 @@ function normalizeBankLabelKey(value) {
         <div class="pp-headMain">
           <div class="pp-titleText">Dashboard Admin</div>
           <div class="pp-nav" id="ppTabs">
-            <button type="button" class="pp-navItem pp-staticNav">Users</button>
+            <button type="button" class="pp-navItem pp-staticNav">Menu</button>
             <button type="button" class="pp-navItem pp-tabButton is-active" data-tab="depo">Deposit <span class="pp-badge pp-badgeGreen" id="ppDepoBadge">0</span></button>
             <button type="button" class="pp-navItem pp-tabButton" data-tab="wd">Withdraw <span class="pp-badge pp-badgeAmber" id="ppWdBadge">0</span></button>
           </div>
@@ -493,6 +495,7 @@ function normalizeBankLabelKey(value) {
   });
 
   setupDrag();
+  setupKeyboardShortcuts();
   window.addEventListener("resize", clampPanel, { passive: true });
   clampPanel();
   initAuthGate();
@@ -686,11 +689,11 @@ function normalizeBankLabelKey(value) {
         --pp-radius: 3px;
         --pp-radius-sm: 2px;
         position: fixed;
-        top: 52px;
-        right: 18px;
-        width: min(1280px, calc(100vw - 36px));
-        height: min(820px, calc(100vh - 70px));
-        max-height: calc(100vh - 70px);
+        top: 20px;
+        right: 12px;
+        width: min(1360px, calc(100vw - 24px));
+        height: min(900px, calc(100vh - 40px));
+        max-height: calc(100vh - 40px);
         background: #fff;
         border: 1px solid #c9d2dc;
         box-shadow: 0 20px 40px rgb(0 0 0 / 0.18);
@@ -1127,20 +1130,24 @@ function normalizeBankLabelKey(value) {
       #${PANEL_ID} .pp-bankChip {
         display: inline-flex;
         align-items: center;
-        gap: 5px;
-        font-size: 12px;
+        gap: 7px;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.15;
       }
       #${PANEL_ID} .pp-bankChipBadge {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-width: 18px;
-        height: 18px;
-        padding: 0 5px;
+        min-width: 24px;
+        height: 24px;
+        padding: 0 8px;
         background: #6b7280;
         color: #fff;
-        font-size: 11px;
-        border-radius: var(--pp-radius);
+        font-size: 12px;
+        font-weight: 800;
+        border-radius: 999px;
+        line-height: 1;
       }
       #${PANEL_ID} .pp-alert {
         margin-bottom: 0;
@@ -1300,6 +1307,77 @@ function normalizeBankLabelKey(value) {
         pointer-events: none;
         cursor: default;
       }
+      #${PANEL_ID} .pp-wd-lock-tooltip-wrap {
+        display: inline-flex;
+        align-items: center;
+        vertical-align: middle;
+        cursor: not-allowed;
+        max-width: 100%;
+      }
+      #${PANEL_ID} .pp-header {
+        min-height: 48px;
+        padding: 0 12px 0 14px;
+      }
+      #${PANEL_ID} .pp-titleText {
+        font-size: 15px;
+      }
+      #${PANEL_ID} .pp-navItem {
+        min-height: 46px;
+        padding: 0 16px;
+        font-size: 13px;
+      }
+      #${PANEL_ID} .pp-tabContent {
+        padding: 16px;
+      }
+      #${PANEL_ID} .pp-sectionHeader h3 {
+        font-size: 22px;
+      }
+      #${PANEL_ID} .pp-bankSummary {
+        gap: 10px;
+        min-height: 24px;
+      }
+      #${PANEL_ID} .btn,
+      #${PANEL_ID} .form-control,
+      #${PANEL_ID} .form-select,
+      #${PANEL_ID} label,
+      #${PANEL_ID} .alert,
+      #${PANEL_ID} .well,
+      #${PANEL_ID} .pp-empty,
+      #${PANEL_ID} .pp-loading,
+      #${PANEL_ID} .pp-error,
+      #${PANEL_ID} .pp-footer,
+      #${PANEL_ID} .table,
+      #${PANEL_ID} table,
+      #${PANEL_ID} td,
+      #${PANEL_ID} th {
+        font-size: 13px !important;
+      }
+      #${PANEL_ID} .btn {
+        font-weight: 700;
+      }
+      #${PANEL_ID} .form-control,
+      #${PANEL_ID} .form-select {
+        min-height: 36px;
+      }
+      #${PANEL_ID} .pp-previewValue,
+      #${PANEL_ID} .pp-userMuted,
+      #${PANEL_ID} .pp-testStatus,
+      #${PANEL_ID} .pp-statusBadge,
+      #${PANEL_ID} .pp-colSectionTitle,
+      #${PANEL_ID} .pp-userField label {
+        font-size: 13px !important;
+      }
+      #${PANEL_ID}, #${PANEL_ID} * {
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+      }
+      #${PANEL_ID}::-webkit-scrollbar,
+      #${PANEL_ID} *::-webkit-scrollbar {
+        width: 0 !important;
+        height: 0 !important;
+        display: none !important;
+        background: transparent !important;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -1433,11 +1511,11 @@ function normalizeBankLabelKey(value) {
       const sinceInteraction = now - (state.lastInteractionAt || 0);
       const fastDepositAutoApprove = activeType === "depo" && state.depo.autoApprove;
       const activeMinAge = state.minimized
-        ? 6000
-        : (fastDepositAutoApprove ? (sinceInteraction < 4500 ? 700 : 950) : (sinceInteraction < 4500 ? 1400 : 2200));
+        ? 7000
+        : (fastDepositAutoApprove ? (sinceInteraction < 4500 ? 900 : 1200) : (sinceInteraction < 4500 ? 1800 : 2800));
       const secondaryMinAge = state.minimized
-        ? 9000
-        : (fastDepositAutoApprove ? 2600 : (sinceInteraction < 4500 ? 3200 : 4200));
+        ? 11000
+        : (fastDepositAutoApprove ? 3200 : (sinceInteraction < 4500 ? 4200 : 5600));
 
       if (!document.hidden) {
         maybeAutoRefresh(activeType, now, activeMinAge);
@@ -1446,7 +1524,7 @@ function normalizeBankLabelKey(value) {
         }
       }
 
-      state.autoSyncTimer = window.setTimeout(loop, state.minimized ? 1200 : 650);
+      state.autoSyncTimer = window.setTimeout(loop, state.minimized ? 1600 : (fastDepositAutoApprove ? 900 : 1200));
     };
     loop();
   }
@@ -1935,7 +2013,7 @@ function normalizeBankLabelKey(value) {
     const isDeposit = type === "depo";
     const bankSummary = renderBankSummary(parsed.bankCounts);
     const autoApproveLockOptions = isDeposit ? getDepositAutoApproveLockOptions() : [];
-    cfg.autoApproveLocks = isDeposit ? normalizeDepositAutoApproveLocks(cfg.autoApproveLocks, { fallbackAll: true }) : cfg.autoApproveLocks;
+    cfg.autoApproveLocks = isDeposit ? normalizeDepositAutoApproveLocks(cfg.autoApproveLocks, { fallbackAll: false }) : cfg.autoApproveLocks;
     const autoApproveLockLabel = isDeposit ? getDepositAutoApproveLockButtonLabel(cfg.autoApproveLocks, autoApproveLockOptions) : "";
     const selectedCount = (cfg.banks || []).length;
     const totalBanks = banks.length;
@@ -2219,7 +2297,7 @@ function bindDepositAutoApproveLockMenu(tab) {
   };
 
   const syncMenuFromState = () => {
-    const selected = new Set(normalizeDepositAutoApproveLocks(cfg.autoApproveLocks, { fallbackAll: true }));
+    const selected = new Set(normalizeDepositAutoApproveLocks(cfg.autoApproveLocks, { fallbackAll: false }));
     getItemBoxes().forEach((box) => {
       box.checked = selected.has(String(box.value));
     });
@@ -2327,11 +2405,46 @@ function bindDepositAutoApproveLockMenu(tab) {
     const actionWrap = tab.querySelector(isDeposit ? "#depositPendingActionButtons" : "#withdrawPendingActionButtons");
     const checkboxes = [...tab.querySelectorAll(rowSelector)];
     const buttons = actionWrap ? [...actionWrap.querySelectorAll("button")] : [];
+    let bulkBusy = false;
 
     const syncActionState = () => {
       if (!actionWrap) return;
       const checkedCount = checkboxes.filter((box) => box.checked).length;
       actionWrap.style.display = checkedCount > 0 ? "flex" : "none";
+      buttons.forEach((button) => {
+        button.disabled = bulkBusy || checkedCount === 0;
+      });
+    };
+
+    const selectedIds = () => checkboxes.filter((box) => box.checked).map((box) => box.value).filter(Boolean);
+
+    const runSerial = async (ids, mode) => {
+      bulkBusy = true;
+      syncActionState();
+      try {
+        for (const id of ids) {
+          if (mode === "approve") {
+            if (isDeposit && typeof window.approveDeposit === "function") {
+              setApproveContextLocal("panel-bulk", "deposit", id);
+              window.approveDeposit(id, false);
+            } else if (!isDeposit && typeof window.approveWithdraw === "function") {
+              setApproveContextLocal("panel-bulk", "withdraw", id);
+              window.approveWithdraw(id, false);
+            }
+          } else if (mode === "reject") {
+            if (isDeposit && typeof window.deleteDeposit === "function") window.deleteDeposit(id, false);
+            if (!isDeposit && typeof window.deleteWithdraw === "function") window.deleteWithdraw(id, false);
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, isDeposit ? 140 : 180));
+        }
+      } finally {
+        bulkBusy = false;
+        checkboxes.forEach((box) => {
+          box.checked = false;
+        });
+        syncActionState();
+        scheduleSectionRefresh(type, true);
+      }
     };
 
     checkboxes.forEach((box) => {
@@ -2347,35 +2460,22 @@ function bindDepositAutoApproveLockMenu(tab) {
 
     buttons.forEach((button) => {
       const text = (button.textContent || "").trim().toLowerCase();
-      button.addEventListener("click", () => {
-        const ids = checkboxes.filter((box) => box.checked).map((box) => box.value).filter(Boolean);
+      button.addEventListener("click", async () => {
+        if (bulkBusy) return;
+        const ids = selectedIds();
         if (!ids.length) return;
 
         if (text.includes("approve")) {
           const ok = confirm(`Approve selected ${isDeposit ? "deposits" : "withdraws"}?`);
           if (!ok) return;
-          ids.forEach((id) => {
-            if (isDeposit && typeof window.approveDeposit === "function") {
-              setApproveContextLocal("panel-bulk", "deposit", id);
-              window.approveDeposit(id, false);
-            }
-            if (!isDeposit && typeof window.approveWithdraw === "function") {
-              setApproveContextLocal("panel-bulk", "withdraw", id);
-              window.approveWithdraw(id, false);
-            }
-          });
-          scheduleSectionRefresh(type, true);
+          await runSerial(ids, "approve");
           return;
         }
 
         if (text.includes("delete") || text.includes("reject")) {
           const ok = confirm(`Reject selected ${isDeposit ? "deposits" : "withdraws"}?`);
           if (!ok) return;
-          ids.forEach((id) => {
-            if (isDeposit && typeof window.deleteDeposit === "function") window.deleteDeposit(id, false);
-            if (!isDeposit && typeof window.deleteWithdraw === "function") window.deleteWithdraw(id, false);
-          });
-          scheduleSectionRefresh(type, true);
+          await runSerial(ids, "reject");
         }
       });
     });
@@ -2579,6 +2679,51 @@ function bindDepositAutoApproveLockMenu(tab) {
     }
   }
 
+
+  function setWithdrawModeTooltipAttrs(el, message) {
+    if (!el) return;
+    const text = String(message || "").trim();
+    if (!text) return;
+    el.setAttribute("title", text);
+    el.setAttribute("data-toggle", "tooltip");
+    el.setAttribute("data-placement", "top");
+    el.setAttribute("data-bs-original-title", text);
+    el.setAttribute("aria-label", text);
+  }
+
+  function clearWithdrawModeTooltipAttrs(el) {
+    if (!el) return;
+    el.removeAttribute("title");
+    el.removeAttribute("data-toggle");
+    el.removeAttribute("data-placement");
+    el.removeAttribute("data-bs-original-title");
+    el.removeAttribute("aria-label");
+  }
+
+  function ensureWithdrawModeButtonTooltipWrap(button) {
+    if (!button) return null;
+    const parent = button.parentElement;
+    if (parent && parent.classList.contains("pp-wd-lock-tooltip-wrap")) return parent;
+    const wrap = document.createElement("span");
+    wrap.className = "pp-wd-lock-tooltip-wrap";
+    wrap.style.display = "inline-flex";
+    wrap.style.alignItems = "center";
+    wrap.style.verticalAlign = "middle";
+    wrap.style.cursor = "not-allowed";
+    wrap.style.maxWidth = "100%";
+    button.insertAdjacentElement("beforebegin", wrap);
+    wrap.appendChild(button);
+    return wrap;
+  }
+
+  function unwrapWithdrawModeButtonTooltip(button) {
+    if (!button) return;
+    const parent = button.parentElement;
+    if (!parent || !parent.classList.contains("pp-wd-lock-tooltip-wrap")) return;
+    parent.insertAdjacentElement("beforebegin", button);
+    parent.remove();
+  }
+
   function setWithdrawModeAmountState(input, disabled) {
     if (!input) return;
     const mirrorId = input.dataset.ppWdModeMirrorId || `pp-wd-amount-mask-${Math.random().toString(36).slice(2, 10)}`;
@@ -2628,8 +2773,12 @@ function bindDepositAutoApproveLockMenu(tab) {
       mirror.textContent = String(input.value || "");
       applyWithdrawModeAmountMirrorStyle(input, mirror);
       mirror.style.display = "flex";
+      setWithdrawModeTooltipAttrs(mirror, "Nominal dikunci saat Mode Safe Withdraw aktif. Hanya row paling atas yang bisa diproses.");
     } else {
-      if (mirror) mirror.remove();
+      if (mirror) {
+        clearWithdrawModeTooltipAttrs(mirror);
+        mirror.remove();
+      }
       if (input.dataset.ppWdModeDisabled != null) input.disabled = input.dataset.ppWdModeDisabled === "1";
       if (input.dataset.ppWdModeReadOnly != null) input.readOnly = input.dataset.ppWdModeReadOnly === "1";
       if (input.dataset.ppWdModeTabIndex != null) {
@@ -2679,7 +2828,12 @@ function bindDepositAutoApproveLockMenu(tab) {
       button.style.opacity = "0.5";
       button.style.pointerEvents = "none";
       button.setAttribute("aria-disabled", "true");
+      const wrap = ensureWithdrawModeButtonTooltipWrap(button);
+      setWithdrawModeTooltipAttrs(wrap, "Approve button dikunci saat Mode Safe Withdraw aktif. Hanya row paling atas yang bisa diproses.");
     } else {
+      const wrap = button.parentElement && button.parentElement.classList && button.parentElement.classList.contains("pp-wd-lock-tooltip-wrap")
+        ? button.parentElement
+        : null;
       if (button.dataset.ppWdModeDisabled != null) button.disabled = button.dataset.ppWdModeDisabled === "1";
       if (button.dataset.ppWdModeTabIndex != null) {
         const nextTabIndex = Number(button.dataset.ppWdModeTabIndex);
@@ -2690,6 +2844,8 @@ function bindDepositAutoApproveLockMenu(tab) {
       if (button.dataset.ppWdModeOpacity != null) button.style.opacity = button.dataset.ppWdModeOpacity;
       if (button.dataset.ppWdModePointer != null) button.style.pointerEvents = button.dataset.ppWdModePointer;
       button.removeAttribute("aria-disabled");
+      if (wrap) clearWithdrawModeTooltipAttrs(wrap);
+      unwrapWithdrawModeButtonTooltip(button);
       delete button.dataset.ppWdModeDisabled;
       delete button.dataset.ppWdModeTabIndex;
       delete button.dataset.ppWdModeOpacity;
@@ -2815,7 +2971,7 @@ function renderDepositAutoApproveUi(tab) {
   const limitText = scope.querySelector("#ppDepoAutoApproveLimitText");
   const stateText = scope.querySelector("#ppDepoAutoApproveState");
   const options = getDepositAutoApproveLockOptions();
-  const selected = normalizeDepositAutoApproveLocks(state.depo.autoApproveLocks, { fallbackAll: true });
+  const selected = normalizeDepositAutoApproveLocks(state.depo.autoApproveLocks, { fallbackAll: false });
   state.depo.autoApproveLocks = selected;
   if (toggle) toggle.checked = !!state.depo.autoApprove;
   if (lockToggle) {
@@ -2885,34 +3041,22 @@ function getDepositAutoApproveLockKeyForRow(row, id) {
   if (!row) return "";
   const options = getDepositAutoApproveLockOptions();
   const allowed = new Set(options.map((item) => item.value));
-  const bankMeta = extractRowBankMeta("depo", row, getAvailableBanks("depo"));
-  const directKey = normalizeDepositAutoApproveLockKey(bankMeta.key || bankMeta.text || bankMeta.value);
+  const escapeId = cssEscapeSafe(id || "");
+
+  const directSelect = row.querySelector(`.approvaldepo${escapeId}`) || row.querySelector(".approvaldepo");
+  const directRek = directSelect ? String(directSelect.getAttribute("rek") || directSelect.getAttribute("data-rek") || "").trim() : "";
+  const directKey = normalizeDepositAutoApproveLockKey(directRek);
   if (directKey && allowed.has(directKey)) return directKey;
 
-  const probeTexts = [];
-  if (bankMeta && bankMeta.text) probeTexts.push(bankMeta.text);
-  if (bankMeta && bankMeta.value) probeTexts.push(bankMeta.value);
-  if (id) {
-    const hidden = row.querySelector(`.rek${cssEscapeSafe(id)}`) || row.querySelector(`input.rek${cssEscapeSafe(id)}`) || row.querySelector("input[class^='rek']");
-    if (hidden && hidden.value) probeTexts.push(hidden.value);
-  }
-  row.querySelectorAll("img[src*='logo-'], input, td, span, div").forEach((el) => {
-    if (probeTexts.length > 48) return;
-    if (el.tagName === "IMG") {
-      const src = el.getAttribute("src") || "";
-      if (src) probeTexts.push(src);
-      return;
-    }
-    const value = "value" in el ? String(el.value || "").trim() : "";
-    const text = String(el.textContent || "").trim();
-    if (value) probeTexts.push(value);
-    if (text) probeTexts.push(text);
-  });
+  const bankMeta = extractRowBankMeta("depo", row, getAvailableBanks("depo"));
+  const metaKey = normalizeDepositAutoApproveLockKey(bankMeta.key || bankMeta.text || bankMeta.value);
+  if (metaKey && allowed.has(metaKey)) return metaKey;
 
-  for (const part of probeTexts) {
-    const detected = detectDepositAutoApproveLockKeyFromText(part);
-    if (detected && allowed.has(detected)) return detected;
-  }
+  const img = row.querySelector("img[src*='logo-']");
+  const src = img ? String(img.getAttribute("src") || "").trim() : "";
+  const imgMatch = src.match(/logo-([^.\/]+)\./i);
+  const imgKey = normalizeDepositAutoApproveLockKey(imgMatch ? imgMatch[1] : "");
+  if (imgKey && allowed.has(imgKey)) return imgKey;
 
   return "";
 }
@@ -2922,42 +3066,38 @@ function getDepositApproveButton(row, id) {
     return row.querySelector(`.dpapproved${cssEscapeSafe(id)}`) || row.querySelector("button[onclick*='approveDeposit(']");
   }
 
+function getDepositExactAmountInput(row, id) {
+    if (!row) return null;
+    const escapeId = cssEscapeSafe(id || "");
+    const selectors = [
+      `.jumlah${escapeId}`,
+      `input.jumlah${escapeId}`,
+      "input[class*='jumlah'][readonly]",
+      "input[class*='jumlah']"
+    ];
+    for (const selector of selectors) {
+      const matches = [...row.querySelectorAll(selector)];
+      for (const el of matches) {
+        if (!el) continue;
+        const className = String(el.className || "");
+        if (selector.includes("class*='jumlah'") && id && className && !className.includes(`jumlah${id}`) && className.includes("bonuseventjumlah")) {
+          continue;
+        }
+        const raw = String(el.value || el.textContent || "").trim();
+        if (!raw) continue;
+        const parsed = parsePositiveAmount(raw, 0);
+        if (parsed > 0) return el;
+      }
+    }
+    return null;
+  }
+
   function getDepositAutoApproveAmount(row, id) {
     if (!row) return 0;
-    try {
-      if (typeof getNominalFromRow === "function") {
-        const direct = getNominalFromRow(row, id);
-        if (Number.isFinite(direct) && direct > 0) return direct;
-      }
-    } catch (_) {}
-
-    const selectors = [
-      `.jumlah${cssEscapeSafe(id || "")}`,
-      "input.ribuan.jumlah",
-      "input[class*='jumlah']",
-      "td input[value*=',']",
-      "td input[value*='.']"
-    ];
-
-    for (const selector of selectors) {
-      const el = row.querySelector(selector);
-      if (!el) continue;
-      const raw = String(el.value || el.textContent || "").trim();
-      const parsed = parsePositiveAmount(raw, 0);
-      if (parsed > 0) return parsed;
-    }
-
-    let best = 0;
-    const texts = typeof collectRowStrings === "function" ? collectRowStrings(row) : [row.textContent || ""];
-    texts.forEach((txt) => {
-      const matches = String(txt || "").match(/-?\d[\d.,]*/g);
-      if (!matches) return;
-      matches.forEach((part) => {
-        const parsed = parsePositiveAmount(part, 0);
-        if (parsed > best) best = parsed;
-      });
-    });
-    return best;
+    const amountInput = getDepositExactAmountInput(row, id);
+    if (!amountInput) return 0;
+    const raw = String(amountInput.value || amountInput.textContent || "").trim();
+    return parsePositiveAmount(raw, 0);
   }
 
   function clearDepositAutoApproveTimer() {
@@ -2990,9 +3130,13 @@ function getDepositApproveButton(row, id) {
 
     const limit = parsePositiveAmount(state.depo.autoApproveLimit, loadDepositAutoApproveLimit() || 20000) || 20000;
     const lockOptions = getDepositAutoApproveLockOptions();
-    const selectedLocks = normalizeDepositAutoApproveLocks(state.depo.autoApproveLocks, { fallbackAll: true });
+    const selectedLocks = normalizeDepositAutoApproveLocks(state.depo.autoApproveLocks, { fallbackAll: false });
     const allowAllLocks = areAllDepositAutoApproveLocksSelected(selectedLocks, lockOptions);
     const selectedLockSet = new Set(selectedLocks);
+    if (!selectedLockSet.size) {
+      renderDepositAutoApproveUi(tab);
+      return false;
+    }
     const runToken = (state.depo.autoApproveRunToken || 0) + 1;
     state.depo.autoApproveRunToken = runToken;
     state.depo.autoApproveLimit = limit;
@@ -3008,7 +3152,7 @@ function getDepositApproveButton(row, id) {
         if (!allowAllLocks && !selectedLockSet.has(rowLockKey)) return null;
         if (!Number.isFinite(amount) || amount <= 0 || amount > limit) return null;
         if (recentlyHandledLocal("panel-auto-deposit-scan:" + id, 1600)) return null;
-        return { id, amount, button, rowLockKey };
+        return { id, amount, button, rowLockKey, row };
       })
       .filter(Boolean)
       .slice(0, 20);
@@ -3026,13 +3170,23 @@ function getDepositApproveButton(row, id) {
       for (const item of candidates) {
         if (!state.depo.autoApprove || state.activeTab !== "depo" || runToken !== state.depo.autoApproveRunToken) break;
         if (recentlyHandledLocal("panel-auto-deposit-action:" + item.id, 3200)) continue;
+
+        const liveRow = tab.querySelector(`#depositPending-${cssEscapeSafe(item.id)}`);
+        const liveAmount = getDepositAutoApproveAmount(liveRow || item.row || null, item.id);
+        const liveLockKey = getDepositAutoApproveLockKeyForRow(liveRow || item.row || null, item.id);
+        const liveButton = getDepositApproveButton(liveRow || item.row || null, item.id);
+
+        if (!liveRow || !liveButton || liveButton.disabled) continue;
+        if (!Number.isFinite(liveAmount) || liveAmount <= 0 || liveAmount > limit) continue;
+        if (!liveLockKey || (!allowAllLocks && !selectedLockSet.has(liveLockKey))) continue;
+
         setApproveContextLocal("auto-deposit", "deposit", item.id);
         let result = null;
         try {
           if (typeof window.approveDeposit === "function") {
             result = window.approveDeposit(item.id, false);
-          } else if (item.button && typeof item.button.click === "function") {
-            item.button.click();
+          } else if (liveButton && typeof liveButton.click === "function") {
+            liveButton.click();
           }
         } catch (error) {
           console.error("[PP-DEPO-AUTO] approve failed", error);
@@ -3176,6 +3330,36 @@ function getDepositApproveButton(row, id) {
     refs.minimizeBtn.title = state.minimized ? "Show content" : "Hide content";
     refs.minimizeBtn.setAttribute("aria-label", state.minimized ? "Show content" : "Hide content");
     clampPanel();
+  }
+
+  function hasOpenPanelMenu() {
+    return !!refs.panel.querySelector(".pp-bankMenu.is-open");
+  }
+
+  function setupKeyboardShortcuts() {
+    const onWindowKeydown = (event) => {
+      if (event.key !== "Escape") return;
+      if (event.defaultPrevented || event.repeat) return;
+      if (event.ctrlKey || event.altKey || event.metaKey) return;
+      if (!isPanelAlive()) return;
+      if (hasOpenPanelMenu()) return;
+
+      const now = Date.now();
+      if (now - (state.lastEscShortcutAt || 0) < 140) return;
+      state.lastEscShortcutAt = now;
+
+      event.preventDefault();
+      event.stopPropagation();
+      markInteracting(220);
+
+      requestAnimationFrame(() => {
+        if (!isPanelAlive() || !refs.minimizeBtn) return;
+        refs.minimizeBtn.click();
+      });
+    };
+
+    window.addEventListener("keydown", onWindowKeydown, true);
+    state.cleanupFns.push(() => window.removeEventListener("keydown", onWindowKeydown, true));
   }
 
   function setupDrag() {
@@ -3830,7 +4014,7 @@ function getDepositApproveButton(row, id) {
           if (res.status >= 400 && res.status < 500 && res.status !== 429) {
             pushDead(type, rows);
             updateStats({ errAt: now() });
-            return false;
+            return null;
           }
           throw new Error("HTTP " + res.status);
         }
@@ -3923,6 +4107,8 @@ function getDepositApproveButton(row, id) {
       { type: "pulsa" }
     ];
     const cfg = getCfgNetwork();
+    const seenSet = new Set(loadSeen());
+    const seenToAppend = [];
 
     try {
       const tasks = [];
@@ -3932,7 +4118,7 @@ function getDepositApproveButton(row, id) {
         const sending = dedupeRowsBySig(buf.splice(0, buf.length), item.type, "queue");
         const filtered = sending.filter((row) => {
           const sig = rowSeenSig(item.type, row);
-          return !sig || !seenHas(sig);
+          return !sig || !seenSet.has(sig);
         });
         if (!filtered.length) continue;
 
@@ -3954,9 +4140,16 @@ function getDepositApproveButton(row, id) {
             tasks.push(async () => {
               try {
                 const ok = await fetchRetry(bucket.url, chunk, item.type, cfg.RETRY, cfg.BASE_DELAY);
-                if (ok) {
-                  seenAddMany(chunk.map((row) => rowSeenSig(item.type, row)).filter(Boolean));
-                } else {
+                if (ok === true) {
+                  chunk.map((row) => rowSeenSig(item.type, row)).filter(Boolean).forEach((sig) => {
+                    if (!seenSet.has(sig)) {
+                      seenSet.add(sig);
+                      seenToAppend.push(sig);
+                    }
+                  });
+                  return;
+                }
+                if (ok === false) {
                   chunk.forEach((row) => memoryQueue[item.type].push(row));
                 }
               } catch (_) {
@@ -3968,6 +4161,9 @@ function getDepositApproveButton(row, id) {
       }
       if (tasks.length) {
         await runPool(tasks, cfg.CONC);
+      }
+      if (seenToAppend.length) {
+        saveSeen(Array.from(seenSet).slice(-600));
       }
     } finally {
       flushBusy = false;
@@ -4425,6 +4621,25 @@ function getDepositApproveButton(row, id) {
     return true;
   }
 
+  function waitForPendingRowRemoval(kind, id, timeoutMs = 5000, intervalMs = 160) {
+    return new Promise((resolve) => {
+      const startedAt = now();
+      const selector = `#${kind === "deposit" ? "depositPending-" : "withdrawPending-"}${id}`;
+      const check = () => {
+        if (!document.querySelector(selector)) {
+          resolve(true);
+          return;
+        }
+        if (now() - startedAt >= timeoutMs) {
+          resolve(false);
+          return;
+        }
+        window.setTimeout(check, intervalMs);
+      };
+      check();
+    });
+  }
+
   function wrapNativeApprovals() {
     const nativeDepo = window.approveDeposit;
     const nativeWd = window.approveWithdraw;
@@ -4447,9 +4662,20 @@ function getDepositApproveButton(row, id) {
       }
       const meta = invokeWithConfirmTracking(nativeDepo, this, arguments);
       try {
-        if (shouldProcessNativeAction(meta) && ctx && payload && payload.rows && payload.rows.length && !recentlyHandled("panel-approve:deposit:" + id, 8000)) {
-          if (isGsOn()) sendToGSheetBatch(payload.rows, payload.type);
-          if (isAutoCopyOn()) queueMicrotask(() => { autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] deposit failed", error)); });
+        if (shouldProcessNativeAction(meta) && ctx && payload && payload.rows && payload.rows.length) {
+          queueMicrotask(async () => {
+            try {
+              const removed = await waitForPendingRowRemoval("deposit", id, ctx && ctx.source === "auto-deposit" ? 6500 : 5000, 170);
+              if (!removed) return;
+              if (recentlyHandled("panel-approve:deposit:" + id, 8000)) return;
+              if (isGsOn()) sendToGSheetBatch(payload.rows, payload.type);
+              if (isAutoCopyOn()) {
+                await autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] deposit failed", error));
+              }
+            } catch (error) {
+              console.error("[PP-GS] deposit queue failed", error);
+            }
+          });
         }
         if (shouldProcessNativeAction(meta) && !(ctx && ctx.source === "auto-deposit")) {
           queueMicrotask(() => schedulePanelRefresh("depo", true));
@@ -4473,9 +4699,20 @@ function getDepositApproveButton(row, id) {
       }
       const meta = invokeWithConfirmTracking(nativeWd, this, arguments);
       try {
-        if (shouldProcessNativeAction(meta) && ctx && payload && payload.rows && payload.rows.length && !recentlyHandled("panel-approve:withdraw:" + id, 8000)) {
-          if (isGsOn()) sendToGSheetBatch(payload.rows, payload.type);
-          if (isAutoCopyOn()) queueMicrotask(() => { autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] withdraw failed", error)); });
+        if (shouldProcessNativeAction(meta) && ctx && payload && payload.rows && payload.rows.length) {
+          queueMicrotask(async () => {
+            try {
+              const removed = await waitForPendingRowRemoval("withdraw", id, 5000, 170);
+              if (!removed) return;
+              if (recentlyHandled("panel-approve:withdraw:" + id, 8000)) return;
+              if (isGsOn()) sendToGSheetBatch(payload.rows, payload.type);
+              if (isAutoCopyOn()) {
+                await autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] withdraw failed", error));
+              }
+            } catch (error) {
+              console.error("[PP-GS] withdraw queue failed", error);
+            }
+          });
         }
         if (shouldProcessNativeAction(meta)) {
           queueMicrotask(() => schedulePanelRefresh("wd", true));
@@ -4512,13 +4749,31 @@ function getDepositApproveButton(row, id) {
 
   function startWrapWatcher() {
     if (wrapWatchTimer) return;
-    wrapWatchTimer = window.setInterval(() => {
-      try {
-        wrapNativeApprovals();
-      } catch (error) {
-        console.error("[PP-GS] wrap watcher failed", error);
+    const tick = () => {
+      wrapWatchTimer = window.setTimeout(() => {
+        wrapWatchTimer = 0;
+        try {
+          wrapNativeApprovals();
+        } catch (error) {
+          console.error("[PP-GS] wrap watcher failed", error);
+        }
+        if (document.visibilityState !== "hidden") {
+          startWrapWatcher();
+        } else {
+          wrapWatchTimer = window.setTimeout(() => {
+            wrapWatchTimer = 0;
+            startWrapWatcher();
+          }, 10000);
+        }
+      }, document.visibilityState === "hidden" ? 6000 : 2200);
+    };
+    tick();
+    window.addEventListener("pagehide", () => {
+      if (wrapWatchTimer) {
+        clearTimeout(wrapWatchTimer);
+        wrapWatchTimer = 0;
       }
-    }, 1200);
+    }, { once: true });
   }
 
   function injectUserStyle() {
@@ -4552,12 +4807,13 @@ function getDepositApproveButton(row, id) {
       #${PANEL_ID} .pp-testLayout{display:grid;grid-template-columns:minmax(280px,1.05fr) minmax(320px,1.15fr);gap:14px;margin-top:12px}
       #${PANEL_ID} .pp-testPane{border:1px solid #e2e8f0;background:#f8fafc;border-radius:8px;padding:12px;min-width:0}
       #${PANEL_ID} .pp-testPaneHead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-      #${PANEL_ID} .pp-testMetaGrid{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:10px}
+      #${PANEL_ID} .pp-testMetaGrid{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}
       #${PANEL_ID} .pp-previewValue{display:flex;align-items:center;width:100%;min-height:40px;padding:9px 11px;border:1px solid #d7e0ea;border-radius:8px;background:#fff;color:#0f172a;font-size:12px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #${PANEL_ID} .pp-previewValue.pp-previewMono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
       #${PANEL_ID} .pp-userInput.pp-is-readonly{background:#f3f4f6;color:#6b7280;cursor:not-allowed}
-      #${PANEL_ID} .pp-endpointPreview{position:relative;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}
-      #${PANEL_ID} .pp-endpointPreview[data-has-url="1"]{cursor:default}
+      #${PANEL_ID} .pp-endpointPreview{display:block;position:relative;min-height:40px;max-height:none;overflow-x:auto;overflow-y:hidden;white-space:nowrap;word-break:normal;overflow-wrap:normal;text-overflow:clip;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);cursor:pointer;scrollbar-width:none;-ms-overflow-style:none}
+      #${PANEL_ID} .pp-endpointPreview[data-has-url="1"]{cursor:pointer}
+      #${PANEL_ID} .pp-endpointPreview::-webkit-scrollbar{width:0 !important;height:0 !important;display:none !important;background:transparent !important}
       #${PANEL_ID} .pp-testStatus{display:flex;align-items:center;gap:8px;min-height:44px;border:1px solid #e2e8f0;background:#f8fafc;border-radius:8px;padding:12px 13px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;font-weight:700;color:#334155}
       #${PANEL_ID} .pp-testStatus::before{content:'';flex:0 0 auto;width:9px;height:9px;border-radius:999px;background:#94a3b8;box-shadow:0 0 0 4px rgba(148,163,184,.12)}
       #${PANEL_ID} .pp-testStatus.is-ok{background:#ecfdf5;border-color:#bbf7d0;color:#166534}
@@ -4702,6 +4958,30 @@ function getDepositApproveButton(row, id) {
     if (kind === "err") box.classList.add("is-err");
   }
 
+  function refreshUserConfigState(tab) {
+    if (!tab) return;
+    const cfg = loadCfg();
+    const status = tab.querySelector("#ppGsStatus");
+    const toggle = tab.querySelector("#ppGsToggle");
+    const autoCopyToggle = tab.querySelector("#ppAutoCopyToggle");
+    if (status) {
+      status.textContent = cfg.enabled ? "Google Sheet ON" : "Google Sheet OFF";
+      status.className = cfg.enabled ? "pp-statusBadge pp-statusOn" : "pp-statusBadge pp-statusOff";
+    }
+    if (toggle) toggle.checked = !!cfg.enabled;
+    if (autoCopyToggle) autoCopyToggle.checked = !!cfg.autoCopy;
+    ["A", "B", "C", "D", "E"].forEach((key) => {
+      const input = tab.querySelector(`#ppGs${key}`);
+      if (input) input.value = cfg.urls[key] || "";
+    });
+    tab.querySelectorAll("[data-col-key]").forEach((input) => {
+      const key = input.getAttribute("data-col-key");
+      if (!key) return;
+      input.value = cfg.colMap[key] || "";
+    });
+    updateTestPreview(tab);
+  }
+
   function updateTestPreview(tab) {
     const type = tab.querySelector("#ppTestType")?.value || "deposit";
     syncTestBankFieldState(tab);
@@ -4721,8 +5001,8 @@ function getDepositApproveButton(row, id) {
     const autoCol = result && !result.error ? result.targetCol : String(form.targetCol || (type === "withdraw" ? pickWithdrawTargetCol(previewBankKey) : pickTargetCol(previewBankKey)) || "").trim().toUpperCase();
 
     if (endpointPreview) {
-      const rawEndpoint = (result && result.endpoint) || getTestEndpoint(type) || "";
-      endpointPreview.textContent = rawEndpoint ? compactUrl(rawEndpoint) : "Endpoint belum diisi";
+      const rawEndpoint = String((result && result.endpoint) || getTestEndpoint(type) || "").trim();
+      endpointPreview.textContent = rawEndpoint || "Endpoint belum diisi";
       endpointPreview.title = rawEndpoint || "Endpoint belum diisi";
       endpointPreview.dataset.hasUrl = rawEndpoint ? "1" : "0";
       endpointPreview.dataset.fullUrl = rawEndpoint || "";
@@ -4849,7 +5129,7 @@ Response: ${snippet}`;
       <div class="pp-sectionHeader">
         <div class="pp-userTop">
           <div>
-            <h3 style="margin:0">Users</h3>
+            <h3 style="margin:0">Menu</h3>
             <div class="pp-userMuted" style="margin-top:4px">Menu Google Sheet untuk auto input saat approve deposit / withdraw, termasuk jalur khusus DANA.</div>
           </div>
           <div class="${badgeClass}" id="ppGsStatus">${cfg.enabled ? "Google Sheet ON" : "Google Sheet OFF"}</div>
@@ -4986,6 +5266,7 @@ Response: ${snippet}`;
     if (toggle) {
       toggle.addEventListener("change", async () => {
         const saved = setGsOn(toggle.checked);
+        refreshUserConfigState(tab);
         if (saved && saved.enabled) {
           try {
             if (typeof window.alert === "function") {
@@ -5000,6 +5281,7 @@ Response: ${snippet}`;
     if (autoCopyToggle) {
       autoCopyToggle.addEventListener("change", async () => {
         const saved = setAutoCopyOn(autoCopyToggle.checked);
+        refreshUserConfigState(tab);
         if (saved && saved.autoCopy) {
           await showNativeBrowserNotice("Auto Copy ON", "Format approve sekarang otomatis dicopy ke clipboard saat approve.");
         }
@@ -5015,6 +5297,7 @@ Response: ${snippet}`;
           tab.querySelector("#ppGsD")?.value || "",
           tab.querySelector("#ppGsE")?.value || ""
         );
+        refreshUserConfigState(tab);
         try {
           if (typeof window.alert === "function") window.alert("Endpoint Google Sheet berhasil disimpan.");
         } catch (_) {}
@@ -5026,12 +5309,14 @@ Response: ${snippet}`;
         const cfg = loadCfg();
         cfg.urls = { ...DEFAULT_CFG.urls };
         saveCfg(cfg);
+        refreshUserConfigState(tab);
       });
     }
 
     if (colSaveBtn) {
       colSaveBtn.addEventListener("click", () => {
         setColMap(readColMapFromInputs());
+        refreshUserConfigState(tab);
         try {
           if (typeof window.alert === "function") window.alert("Set Kolom Tujuan berhasil disimpan.");
         } catch (_) {}
@@ -5041,6 +5326,7 @@ Response: ${snippet}`;
     if (colResetBtn) {
       colResetBtn.addEventListener("click", () => {
         setColMap({});
+        refreshUserConfigState(tab);
       });
     }
 
@@ -5069,11 +5355,9 @@ Response: ${snippet}`;
     if (endpointPreviewBox) {
       endpointPreviewBox.addEventListener("click", async () => {
         const fullUrl = String(endpointPreviewBox.dataset.fullUrl || "").trim();
-        if (!fullUrl || !navigator.clipboard || typeof navigator.clipboard.writeText !== "function") return;
-        try {
-          await navigator.clipboard.writeText(fullUrl);
-          endpointPreviewBox.title = `${fullUrl}\n\nEndpoint penuh berhasil dicopy.`;
-        } catch (_) {}
+        if (!fullUrl) return;
+        const ok = await copyPlainText(fullUrl);
+        endpointPreviewBox.title = ok ? `${fullUrl}\n\nEndpoint penuh berhasil dicopy.` : fullUrl;
       });
     }
 
@@ -5083,10 +5367,13 @@ Response: ${snippet}`;
       });
     }
 
+    refreshUserConfigState(tab);
     syncTestBankFieldState(tab);
 
     if (testType) {
       fillTestDefaults(tab);
+    } else {
+      updateTestPreview(tab);
     }
   }
 
@@ -5131,12 +5418,12 @@ Response: ${snippet}`;
     panel.__ppGsUserNavBound = true;
     let userBtn = tabs.querySelector('[data-tab="user"]');
     if (!userBtn) {
-      const legacyUsers = [...tabs.querySelectorAll(".pp-staticNav")].find((el) => /users/i.test(el.textContent || ""));
+      const legacyUsers = [...tabs.querySelectorAll(".pp-staticNav")].find((el) => /users|menu/i.test(el.textContent || ""));
       userBtn = document.createElement("button");
       userBtn.type = "button";
       userBtn.className = "pp-navItem pp-tabButton";
       userBtn.dataset.tab = "user";
-      userBtn.textContent = "Users";
+      userBtn.textContent = "Menu";
       if (legacyUsers) legacyUsers.replaceWith(userBtn);
       else tabs.insertBefore(userBtn, tabs.firstChild);
     }
