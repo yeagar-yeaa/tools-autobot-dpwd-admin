@@ -345,6 +345,7 @@ function normalizeBankLabelKey(value) {
     menuCloseFns: { depo: null, wd: null, depoAutoApproveLock: null },
     drag: { active: false, startX: 0, startY: 0, left: 0, top: 0, pointerId: null },
     lastEscShortcutAt: 0,
+    lastSafeWithdrawAlertAt: 0,
     depo: {
       showAll: true,
       sortBy: "date",
@@ -589,6 +590,7 @@ function normalizeBankLabelKey(value) {
     state.mainBooted = true;
     setupDrag();
     setupInteractionGuards();
+    bindSafeWithdrawLockGuard();
     clampPanel();
     syncNativeMenu(state.activeTab);
     loadSection("depo", { initial: true });
@@ -596,6 +598,7 @@ function normalizeBankLabelKey(value) {
     startAutoSync();
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleWindowFocus, { passive: true });
+    window.addEventListener("blur", handleWindowBlur, { passive: true });
   }
 
   function unlockPanel(options = {}) {
@@ -789,6 +792,9 @@ function normalizeBankLabelKey(value) {
         font-size: 12px;
         line-height: 1.4;
       }
+      #${PANEL_ID}:not(.is-auth-locked) .pp-authMarqueeTrack {
+        animation: none !important;
+      }
       #${PANEL_ID} .pp-authLoginPanel {
         width: min(100%, 290px);
         margin-top: 0;
@@ -944,6 +950,16 @@ function normalizeBankLabelKey(value) {
       @keyframes ppAuthMarquee {
         0% { transform: translateX(0); }
         100% { transform: translateX(-50%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #${PANEL_ID},
+        #${PANEL_ID} *,
+        #${PANEL_ID} *::before,
+        #${PANEL_ID} *::after {
+          animation: none !important;
+          transition: none !important;
+          scroll-behavior: auto !important;
+        }
       }
       #${PANEL_ID} .pp-shell {
         display: flex;
@@ -1497,34 +1513,40 @@ function normalizeBankLabelKey(value) {
   }
 
   function startAutoSync() {
-    if (!isPanelAlive()) return;
-    stopAutoSync();
+    if (!isPanelAlive() || state.autoSyncTimer || document.hidden) return;
     Object.keys(state.menuCloseFns || {}).forEach((key) => {
       const fn = state.menuCloseFns[key];
       if (typeof fn === "function") document.removeEventListener("mousedown", fn, true);
     });
     const loop = () => {
       if (!isPanelAlive()) return;
+      if (document.hidden) {
+        stopAutoSync();
+        return;
+      }
       const now = Date.now();
       const activeType = state.activeTab;
       const secondaryType = activeType === "depo" ? "wd" : "depo";
       const sinceInteraction = now - (state.lastInteractionAt || 0);
       const fastDepositAutoApprove = activeType === "depo" && state.depo.autoApprove;
       const activeMinAge = state.minimized
-        ? 7000
-        : (fastDepositAutoApprove ? (sinceInteraction < 4500 ? 900 : 1200) : (sinceInteraction < 4500 ? 1800 : 2800));
+        ? (fastDepositAutoApprove ? 4800 : 8200)
+        : (fastDepositAutoApprove ? (sinceInteraction < 3200 ? 900 : 1200) : (sinceInteraction < 3200 ? 1900 : 2800));
       const secondaryMinAge = state.minimized
-        ? 11000
-        : (fastDepositAutoApprove ? 3200 : (sinceInteraction < 4500 ? 4200 : 5600));
+        ? 18000
+        : (fastDepositAutoApprove ? (sinceInteraction < 3200 ? 3000 : 3600) : (sinceInteraction < 3200 ? 4200 : 5600));
+      const nextDelay = state.minimized
+        ? (fastDepositAutoApprove ? 1450 : 3200)
+        : (fastDepositAutoApprove
+            ? (sinceInteraction < 2200 ? 950 : 1150)
+            : (sinceInteraction < 2200 ? 1200 : 1450));
 
-      if (!document.hidden) {
-        maybeAutoRefresh(activeType, now, activeMinAge);
-        if (state.initialized[secondaryType]) {
-          maybeAutoRefresh(secondaryType, now, secondaryMinAge);
-        }
+      maybeAutoRefresh(activeType, now, activeMinAge);
+      if (!state.minimized && state.initialized[secondaryType]) {
+        maybeAutoRefresh(secondaryType, now, secondaryMinAge);
       }
 
-      state.autoSyncTimer = window.setTimeout(loop, state.minimized ? 1600 : (fastDepositAutoApprove ? 900 : 1200));
+      state.autoSyncTimer = window.setTimeout(loop, nextDelay);
     };
     loop();
   }
@@ -1554,8 +1576,9 @@ function normalizeBankLabelKey(value) {
     loadSection(type, { busyText: "Syncing...", silent: true });
   }
 
-  function handleVisibilityChange() {
+  function resumeActiveSync(forceRefresh) {
     if (!isPanelAlive() || document.hidden) return;
+    if (!state.autoSyncTimer) startAutoSync();
     const activeType = state.activeTab;
     if (activeType === "depo" && state.depo.autoApproveBusy) return;
     if (!isInteractionLocked(activeType) && flushDeferredRender(activeType)) return;
@@ -1563,21 +1586,29 @@ function normalizeBankLabelKey(value) {
       state.pendingReload[activeType] = true;
       return;
     }
-    loadSection(activeType, { busyText: "Syncing...", silent: true });
+    const staleAge = (activeType === "depo" && state.depo.autoApprove) ? 650 : 1200;
+    if (forceRefresh || (Date.now() - (state.lastLoadedAt[activeType] || 0) > staleAge)) {
+      loadSection(activeType, { busyText: "Syncing...", silent: true });
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (!isPanelAlive()) return;
+    if (document.hidden) {
+      stopAutoSync();
+      return;
+    }
+    resumeActiveSync(true);
   }
 
   function handleWindowFocus() {
     if (!isPanelAlive()) return;
-    const activeType = state.activeTab;
-    if (activeType === "depo" && state.depo.autoApproveBusy) return;
-    if (!isInteractionLocked(activeType) && flushDeferredRender(activeType)) return;
-    if (state.loading[activeType]) {
-      state.pendingReload[activeType] = true;
-      return;
-    }
-    if (Date.now() - (state.lastLoadedAt[activeType] || 0) > ((activeType === "depo" && state.depo.autoApprove) ? 650 : 1200)) {
-      loadSection(activeType, { busyText: "Syncing...", silent: true });
-    }
+    resumeActiveSync(false);
+  }
+
+  function handleWindowBlur() {
+    if (!isPanelAlive()) return;
+    if (document.hidden) stopAutoSync();
   }
 
   function scheduleIdlePreload(type) {
@@ -2166,8 +2197,7 @@ function normalizeBankLabelKey(value) {
       if (queueModeInput) {
         queueModeInput.checked = !!cfg.queueMode;
         queueModeInput.addEventListener("change", () => {
-          cfg.queueMode = saveWithdrawMode(!!queueModeInput.checked);
-          applyWithdrawQueueMode(tab);
+          cfg.queueMode = setWithdrawQueueModeEnabled(!!queueModeInput.checked, { notify: !!queueModeInput.checked });
         });
       }
 
@@ -2829,6 +2859,7 @@ function bindDepositAutoApproveLockMenu(tab) {
       button.style.pointerEvents = "none";
       button.setAttribute("aria-disabled", "true");
       const wrap = ensureWithdrawModeButtonTooltipWrap(button);
+      if (wrap) wrap.setAttribute("data-mode-withdraw-locked", "1");
       setWithdrawModeTooltipAttrs(wrap, "Approve button dikunci saat Mode Safe Withdraw aktif. Hanya row paling atas yang bisa diproses.");
     } else {
       const wrap = button.parentElement && button.parentElement.classList && button.parentElement.classList.contains("pp-wd-lock-tooltip-wrap")
@@ -2844,7 +2875,10 @@ function bindDepositAutoApproveLockMenu(tab) {
       if (button.dataset.ppWdModeOpacity != null) button.style.opacity = button.dataset.ppWdModeOpacity;
       if (button.dataset.ppWdModePointer != null) button.style.pointerEvents = button.dataset.ppWdModePointer;
       button.removeAttribute("aria-disabled");
-      if (wrap) clearWithdrawModeTooltipAttrs(wrap);
+      if (wrap) {
+        clearWithdrawModeTooltipAttrs(wrap);
+        wrap.removeAttribute("data-mode-withdraw-locked");
+      }
       unwrapWithdrawModeButtonTooltip(button);
       delete button.dataset.ppWdModeDisabled;
       delete button.dataset.ppWdModeTabIndex;
@@ -2879,6 +2913,56 @@ function bindDepositAutoApproveLockMenu(tab) {
     const nomorWrap = nomorInput || null;
     const jumlahWrap = jumlahInput || null;
     return { nomorInput, jumlahInput, nomorWrap, jumlahWrap, approveBtn };
+  }
+
+  function showSafeWithdrawNativeAlert() {
+    if (!state.wd.queueMode) return false;
+    const now = Date.now();
+    if (now - (state.lastSafeWithdrawAlertAt || 0) < 1200) return false;
+    state.lastSafeWithdrawAlertAt = now;
+    try {
+      if (typeof window.alert === "function") {
+        window.alert("Mode Safe Withdraw Aktif.");
+        return true;
+      }
+    } catch (error) {
+      console.error(error);
+    }
+    return false;
+  }
+
+  function bindSafeWithdrawLockGuard() {
+    const tab = refs.wdTab;
+    if (!tab || tab.__ppSafeWithdrawLockGuardBound) return;
+    tab.__ppSafeWithdrawLockGuardBound = true;
+    const onGuard = (event) => {
+      if (!state.wd.queueMode || !event || !event.target || !event.target.closest) return;
+      const lockedTarget = event.target.closest('[data-mode-withdraw-locked="1"], .pp-wd-lock-tooltip-wrap[data-mode-withdraw-locked="1"]');
+      if (!lockedTarget) return;
+      event.preventDefault();
+      event.stopPropagation();
+      showSafeWithdrawNativeAlert();
+    };
+    ["pointerdown", "mousedown", "touchstart", "click"].forEach((type) => {
+      tab.addEventListener(type, onGuard, true);
+      state.cleanupFns.push(() => tab.removeEventListener(type, onGuard, true));
+    });
+  }
+
+  function setWithdrawQueueModeEnabled(enabled, options = {}) {
+    const next = saveWithdrawMode(!!enabled);
+    const changed = state.wd.queueMode !== next;
+    state.wd.queueMode = next;
+    const tab = refs.wdTab;
+    const toggle = tab ? tab.querySelector("#ppWdQueueMode") : null;
+    if (toggle && toggle.checked !== next) toggle.checked = next;
+    if (tab && document.body.contains(tab)) {
+      applyWithdrawQueueMode(tab);
+    }
+    if (next && options.notify !== false && (changed || options.forceNotify)) {
+      showSafeWithdrawNativeAlert();
+    }
+    return next;
   }
 
   function applyWithdrawQueueMode(tab) {
@@ -3301,7 +3385,7 @@ function getDepositExactAmountInput(row, id) {
     const baseFingerprint = state.fingerprints[type] || "";
     const baseSignature = state.signatures[type] || "";
     state.refreshRunId[type] = runId;
-    const delays = immediate ? [70, 260, 900] : [0];
+    const delays = immediate ? [90, 340, 980] : [0];
 
     delays.forEach((delay, index) => {
       const timer = window.setTimeout(async () => {
@@ -3324,12 +3408,24 @@ function getDepositExactAmountInput(row, id) {
     });
   }
 
-  function toggleMinimize() {
-    state.minimized = !state.minimized;
+  function toggleMinimize(forceValue) {
+    const next = typeof forceValue === "boolean" ? !!forceValue : !state.minimized;
+    if (state.minimized === next) return state.minimized;
+    state.minimized = next;
     refs.panel.classList.toggle("is-minimized", state.minimized);
     refs.minimizeBtn.title = state.minimized ? "Show content" : "Hide content";
     refs.minimizeBtn.setAttribute("aria-label", state.minimized ? "Show content" : "Hide content");
     clampPanel();
+    if (!state.minimized && isAuthenticated()) {
+      const activeType = state.activeTab;
+      if (!state.loading[activeType] && Date.now() - (state.lastLoadedAt[activeType] || 0) > 1200) {
+        loadSection(activeType, { busyText: "Syncing...", silent: true });
+      }
+      if (activeType === "depo" && state.depo.autoApprove) {
+        scheduleDepositAutoApprove(120);
+      }
+    }
+    return state.minimized;
   }
 
   function hasOpenPanelMenu() {
@@ -3352,10 +3448,8 @@ function getDepositExactAmountInput(row, id) {
       event.stopPropagation();
       markInteracting(220);
 
-      requestAnimationFrame(() => {
-        if (!isPanelAlive() || !refs.minimizeBtn) return;
-        refs.minimizeBtn.click();
-      });
+      if (!isPanelAlive() || !refs.minimizeBtn) return;
+      toggleMinimize();
     };
 
     window.addEventListener("keydown", onWindowKeydown, true);
@@ -3461,6 +3555,7 @@ function getDepositExactAmountInput(row, id) {
     if (style) style.remove();
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     window.removeEventListener("focus", handleWindowFocus);
+    window.removeEventListener("blur", handleWindowBlur);
     window.removeEventListener("resize", clampPanel);
     if (window[PANEL_SHARED_KEY] === panelSharedApi) {
       delete window[PANEL_SHARED_KEY];
@@ -3567,6 +3662,9 @@ function getDepositExactAmountInput(row, id) {
   let uiStyleInjected = false;
   let wrappedSignature = "";
   let wrapWatchTimer = 0;
+  let wrapWatchLifecycleBound = false;
+  let bootRetryTimer = 0;
+  let bootObserver = null;
 
   function getPanelShared() {
     return window.__ppPendingShared || {};
@@ -4747,33 +4845,33 @@ function getDepositExactAmountInput(row, id) {
     window[WRAP_LOCK] = true;
   }
 
+  function stopWrapWatcher() {
+    if (wrapWatchTimer) {
+      clearTimeout(wrapWatchTimer);
+      wrapWatchTimer = 0;
+    }
+  }
+
   function startWrapWatcher() {
-    if (wrapWatchTimer) return;
-    const tick = () => {
-      wrapWatchTimer = window.setTimeout(() => {
-        wrapWatchTimer = 0;
-        try {
-          wrapNativeApprovals();
-        } catch (error) {
-          console.error("[PP-GS] wrap watcher failed", error);
-        }
-        if (document.visibilityState !== "hidden") {
-          startWrapWatcher();
-        } else {
-          wrapWatchTimer = window.setTimeout(() => {
-            wrapWatchTimer = 0;
-            startWrapWatcher();
-          }, 10000);
-        }
-      }, document.visibilityState === "hidden" ? 6000 : 2200);
-    };
-    tick();
-    window.addEventListener("pagehide", () => {
-      if (wrapWatchTimer) {
-        clearTimeout(wrapWatchTimer);
-        wrapWatchTimer = 0;
+    if (document.visibilityState === "hidden" || wrapWatchTimer) return;
+    if (!wrapWatchLifecycleBound) {
+      wrapWatchLifecycleBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") stopWrapWatcher();
+        else startWrapWatcher();
+      }, { passive: true });
+      window.addEventListener("focus", startWrapWatcher, { passive: true });
+      window.addEventListener("pagehide", stopWrapWatcher, { passive: true });
+    }
+    wrapWatchTimer = window.setTimeout(() => {
+      wrapWatchTimer = 0;
+      try {
+        wrapNativeApprovals();
+      } catch (error) {
+        console.error("[PP-GS] wrap watcher failed", error);
       }
-    }, { once: true });
+      startWrapWatcher();
+    }, 2400);
   }
 
   function injectUserStyle() {
@@ -5465,6 +5563,40 @@ Response: ${snippet}`;
       .replace(/'/g, "&#39;");
   }
 
+  function stopBootRetry() {
+    if (bootRetryTimer) {
+      clearTimeout(bootRetryTimer);
+      bootRetryTimer = 0;
+    }
+    if (bootObserver) {
+      try { bootObserver.disconnect(); } catch (_) {}
+      bootObserver = null;
+    }
+  }
+
+  function startBootRetry() {
+    if (bootRetryTimer || bootObserver) return;
+    const deadlineAt = now() + 15000;
+    const retry = () => {
+      if (boot()) {
+        stopBootRetry();
+        return;
+      }
+      if (now() >= deadlineAt) {
+        stopBootRetry();
+        return;
+      }
+      bootRetryTimer = window.setTimeout(retry, document.visibilityState === "hidden" ? 1200 : 420);
+    };
+    if (typeof MutationObserver === "function" && document.documentElement) {
+      bootObserver = new MutationObserver(() => {
+        if (boot()) stopBootRetry();
+      });
+      bootObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    bootRetryTimer = window.setTimeout(retry, 300);
+  }
+
   function boot() {
     const ok = ensurePatchedUi();
     installPanelApproveSourceCapture();
@@ -5481,10 +5613,7 @@ Response: ${snippet}`;
   }, { passive: true });
 
   if (!boot()) {
-    const timer = setInterval(() => {
-      if (boot()) clearInterval(timer);
-    }, 250);
-    setTimeout(() => clearInterval(timer), 15000);
+    startBootRetry();
   }
 
   window.__PP_GS_USER_TAB_API__ = {
