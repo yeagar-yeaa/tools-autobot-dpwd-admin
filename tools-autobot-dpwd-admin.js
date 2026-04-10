@@ -14,6 +14,7 @@
   const AUTH_STORAGE_KEY = "__ppUiLoginGate_v1";
   const AUTH_USERNAME = "ADMIN";
   const AUTH_PASSWORD = "210514";
+  const AUTH_SESSION_TTL = 1000 * 60 * 60 * 12;
 
   function setApproveContextLocal(source, kind, id) {
     if (id == null || id === "") return null;
@@ -527,7 +528,35 @@ function normalizeBankLabelKey(value) {
 
   function isAuthSessionValid() {
     const session = loadAuthSession();
-    return !!session.ok && session.username === AUTH_USERNAME;
+    if (!session.ok || session.username !== AUTH_USERNAME) return false;
+    const ts = Number(session.ts || 0);
+    if (!Number.isFinite(ts) || ts <= 0) {
+      clearAuthSession();
+      return false;
+    }
+    if (Date.now() - ts > AUTH_SESSION_TTL) {
+      clearAuthSession();
+      return false;
+    }
+    return true;
+  }
+
+  function pauseMainPanelForAuth() {
+    stopAutoSync();
+    clearDepositAutoApproveTimer();
+    state.depo.autoApproveBusy = false;
+    state.pendingReload.depo = false;
+    state.pendingReload.wd = false;
+    state.deferredParsed.depo = null;
+    state.deferredParsed.wd = null;
+    ["depo", "wd"].forEach((type) => {
+      const controller = state.abortControllers[type];
+      if (controller) {
+        try { controller.abort(); } catch (_) {}
+        state.abortControllers[type] = null;
+      }
+      state.loading[type] = false;
+    });
   }
 
   function isAuthenticated() {
@@ -572,6 +601,7 @@ function normalizeBankLabelKey(value) {
   }
 
   function showAuthGate() {
+    pauseMainPanelForAuth();
     state.authUnlocked = false;
     refs.panel.classList.add("is-auth-locked");
     refs.authRoot.style.display = "block";
@@ -3618,6 +3648,7 @@ function getDepositExactAmountInput(row, id) {
     },
     logout() {
       clearAuthSession();
+      pauseMainPanelForAuth();
       showAuthGate();
     }
   };
@@ -3635,9 +3666,14 @@ function getDepositExactAmountInput(row, id) {
   const DEAD_KEY = "__pp_gs_dead_v2";
   const WRAP_LOCK = "__ppGsWrapInstalled";
   const APPROVE_CTX_KEY = "__ppGsApproveCtx";
+  const PATCH_CLEANUP_KEY = "__PP_GS_USER_TAB_CLEANUP__";
+  const ORIGINAL_NATIVE_KEY = "__PP_GS_NATIVE_ORIGINALS__";
+  const WRAP_MARK_KEY = "__ppGsWrappedSignature";
   const RECENT_IDS = new Map();
 
-  if (window.__PP_GS_USER_TAB_PATCH__) return;
+  if (typeof window[PATCH_CLEANUP_KEY] === "function") {
+    try { window[PATCH_CLEANUP_KEY]("reinit"); } catch (error) { console.error("[PP-GS] previous cleanup failed", error); }
+  }
   window.__PP_GS_USER_TAB_PATCH__ = true;
 
   const DEFAULT_CFG = {
@@ -3665,6 +3701,17 @@ function getDepositExactAmountInput(row, id) {
   let wrapWatchLifecycleBound = false;
   let bootRetryTimer = 0;
   let bootObserver = null;
+  let approveCaptureHandler = null;
+  let wrapWatchVisibilityHandler = null;
+  let onlineHandler = null;
+  let flushVisibilityHandler = null;
+  const originalNative = window[ORIGINAL_NATIVE_KEY] || {
+    approveDeposit: null,
+    approveWithdraw: null,
+    deleteDeposit: null,
+    deleteWithdraw: null
+  };
+  window[ORIGINAL_NATIVE_KEY] = originalNative;
 
   function getPanelShared() {
     return window.__ppPendingShared || {};
@@ -4679,7 +4726,7 @@ function getDepositExactAmountInput(row, id) {
     if (!panel || panel.__ppGsApproveCaptureBound) return;
     panel.__ppGsApproveCaptureBound = true;
 
-    panel.addEventListener("click", (event) => {
+    approveCaptureHandler = (event) => {
       const button = event.target && event.target.closest && event.target.closest('button[onclick]');
       if (!button || !panel.contains(button)) return;
       const onclick = String(button.getAttribute("onclick") || "");
@@ -4692,7 +4739,9 @@ function getDepositExactAmountInput(row, id) {
         const id = extractApproveId(button, "withdraw") || (onclick.match(/approveWithdraw\((?:'|")?(\d+)/) || [])[1] || "";
         if (id) setApproveContext("panel-click", "withdraw", id);
       }
-    }, true);
+    };
+
+    panel.addEventListener("click", approveCaptureHandler, true);
   }
 
   function invokeWithConfirmTracking(fn, ctx, argsLike) {
@@ -4739,15 +4788,39 @@ function getDepositExactAmountInput(row, id) {
   }
 
   function wrapNativeApprovals() {
-    const nativeDepo = window.approveDeposit;
-    const nativeWd = window.approveWithdraw;
-    const nativeDeleteDepo = window.deleteDeposit;
-    const nativeDeleteWd = window.deleteWithdraw;
-    const nextSignature = [nativeDepo, nativeWd, nativeDeleteDepo, nativeDeleteWd].map((fn) => typeof fn === "function" ? String(fn) : "").join("||");
-    if (window[WRAP_LOCK] && wrappedSignature === nextSignature) return;
+    const currentDepo = window.approveDeposit;
+    const currentWd = window.approveWithdraw;
+    const currentDeleteDepo = window.deleteDeposit;
+    const currentDeleteWd = window.deleteWithdraw;
+
+    if (typeof currentDepo === "function" && !currentDepo[WRAP_MARK_KEY]) originalNative.approveDeposit = currentDepo;
+    if (typeof currentWd === "function" && !currentWd[WRAP_MARK_KEY]) originalNative.approveWithdraw = currentWd;
+    if (typeof currentDeleteDepo === "function" && !currentDeleteDepo[WRAP_MARK_KEY]) originalNative.deleteDeposit = currentDeleteDepo;
+    if (typeof currentDeleteWd === "function" && !currentDeleteWd[WRAP_MARK_KEY]) originalNative.deleteWithdraw = currentDeleteWd;
+    window[ORIGINAL_NATIVE_KEY] = originalNative;
+
+    const nativeDepo = originalNative.approveDeposit;
+    const nativeWd = originalNative.approveWithdraw;
+    const nativeDeleteDepo = originalNative.deleteDeposit;
+    const nativeDeleteWd = originalNative.deleteWithdraw;
     if (typeof nativeDepo !== "function" || typeof nativeWd !== "function") return;
 
-    window.approveDeposit = function () {
+    const nextSignature = [nativeDepo, nativeWd, nativeDeleteDepo, nativeDeleteWd]
+      .map((fn) => typeof fn === "function" ? String(fn) : "")
+      .join("||");
+
+    if (
+      window[WRAP_LOCK] &&
+      wrappedSignature === nextSignature &&
+      currentDepo && currentDepo[WRAP_MARK_KEY] === nextSignature &&
+      currentWd && currentWd[WRAP_MARK_KEY] === nextSignature &&
+      (!nativeDeleteDepo || (currentDeleteDepo && currentDeleteDepo[WRAP_MARK_KEY] === nextSignature)) &&
+      (!nativeDeleteWd || (currentDeleteWd && currentDeleteWd[WRAP_MARK_KEY] === nextSignature))
+    ) {
+      return;
+    }
+
+    const wrappedDepo = function () {
       const id = extractApproveId(arguments[0], "deposit");
       const ctx = consumeApproveContext("deposit", id);
       let payload = null;
@@ -4783,8 +4856,9 @@ function getDepositExactAmountInput(row, id) {
       }
       return meta.result;
     };
+    wrappedDepo[WRAP_MARK_KEY] = nextSignature;
 
-    window.approveWithdraw = function () {
+    const wrappedWd = function () {
       const id = extractApproveId(arguments[0], "withdraw");
       const ctx = consumeApproveContext("withdraw", id);
       let payload = null;
@@ -4820,25 +4894,33 @@ function getDepositExactAmountInput(row, id) {
       }
       return meta.result;
     };
+    wrappedWd[WRAP_MARK_KEY] = nextSignature;
+
+    window.approveDeposit = wrappedDepo;
+    window.approveWithdraw = wrappedWd;
 
     if (typeof nativeDeleteDepo === "function") {
-      window.deleteDeposit = function () {
+      const wrappedDeleteDepo = function () {
         const meta = invokeWithConfirmTracking(nativeDeleteDepo, this, arguments);
         if (shouldProcessNativeAction(meta)) {
           queueMicrotask(() => schedulePanelRefresh("depo", true));
         }
         return meta.result;
       };
+      wrappedDeleteDepo[WRAP_MARK_KEY] = nextSignature;
+      window.deleteDeposit = wrappedDeleteDepo;
     }
 
     if (typeof nativeDeleteWd === "function") {
-      window.deleteWithdraw = function () {
+      const wrappedDeleteWd = function () {
         const meta = invokeWithConfirmTracking(nativeDeleteWd, this, arguments);
         if (shouldProcessNativeAction(meta)) {
           queueMicrotask(() => schedulePanelRefresh("wd", true));
         }
         return meta.result;
       };
+      wrappedDeleteWd[WRAP_MARK_KEY] = nextSignature;
+      window.deleteWithdraw = wrappedDeleteWd;
     }
 
     wrappedSignature = nextSignature;
@@ -4856,10 +4938,11 @@ function getDepositExactAmountInput(row, id) {
     if (document.visibilityState === "hidden" || wrapWatchTimer) return;
     if (!wrapWatchLifecycleBound) {
       wrapWatchLifecycleBound = true;
-      document.addEventListener("visibilitychange", () => {
+      wrapWatchVisibilityHandler = () => {
         if (document.visibilityState === "hidden") stopWrapWatcher();
         else startWrapWatcher();
-      }, { passive: true });
+      };
+      document.addEventListener("visibilitychange", wrapWatchVisibilityHandler, { passive: true });
       window.addEventListener("focus", startWrapWatcher, { passive: true });
       window.addEventListener("pagehide", stopWrapWatcher, { passive: true });
     }
@@ -5607,14 +5690,60 @@ Response: ${snippet}`;
   }
 
   hydrateQueueFromStorage();
-  window.addEventListener("online", () => scheduleFlush(0), { passive: true });
-  document.addEventListener("visibilitychange", () => {
+  onlineHandler = () => scheduleFlush(0);
+  flushVisibilityHandler = () => {
     if (document.visibilityState === "visible") scheduleFlush(0);
-  }, { passive: true });
+  };
+  window.addEventListener("online", onlineHandler, { passive: true });
+  document.addEventListener("visibilitychange", flushVisibilityHandler, { passive: true });
 
   if (!boot()) {
     startBootRetry();
   }
+
+  window[PATCH_CLEANUP_KEY] = function cleanupUserTabPatch() {
+    stopWrapWatcher();
+    stopBootRetry();
+    if (onlineHandler) {
+      window.removeEventListener("online", onlineHandler);
+      onlineHandler = null;
+    }
+    if (flushVisibilityHandler) {
+      document.removeEventListener("visibilitychange", flushVisibilityHandler);
+      flushVisibilityHandler = null;
+    }
+    if (wrapWatchVisibilityHandler) {
+      document.removeEventListener("visibilitychange", wrapWatchVisibilityHandler);
+      wrapWatchVisibilityHandler = null;
+    }
+    window.removeEventListener("focus", startWrapWatcher);
+    window.removeEventListener("pagehide", stopWrapWatcher);
+    wrapWatchLifecycleBound = false;
+
+    const panel = document.getElementById(PANEL_ID);
+    if (panel && approveCaptureHandler) {
+      try { panel.removeEventListener("click", approveCaptureHandler, true); } catch (_) {}
+      panel.__ppGsApproveCaptureBound = false;
+    }
+    approveCaptureHandler = null;
+
+    if (originalNative.approveDeposit && window.approveDeposit && window.approveDeposit[WRAP_MARK_KEY]) {
+      window.approveDeposit = originalNative.approveDeposit;
+    }
+    if (originalNative.approveWithdraw && window.approveWithdraw && window.approveWithdraw[WRAP_MARK_KEY]) {
+      window.approveWithdraw = originalNative.approveWithdraw;
+    }
+    if (originalNative.deleteDeposit && window.deleteDeposit && window.deleteDeposit[WRAP_MARK_KEY]) {
+      window.deleteDeposit = originalNative.deleteDeposit;
+    }
+    if (originalNative.deleteWithdraw && window.deleteWithdraw && window.deleteWithdraw[WRAP_MARK_KEY]) {
+      window.deleteWithdraw = originalNative.deleteWithdraw;
+    }
+    window[WRAP_LOCK] = false;
+    wrappedSignature = "";
+    window.__PP_GS_USER_TAB_PATCH__ = false;
+    delete window[PATCH_CLEANUP_KEY];
+  };
 
   window.__PP_GS_USER_TAB_API__ = {
     isGsOn, isAutoCopyOn, setGsOn, setAutoCopyOn, getGsUrls, setGsUrls, getColMap, setColMap, flushSend, sendToGSheetBatch, autoCopyPayload
