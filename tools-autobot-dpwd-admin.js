@@ -16,6 +16,129 @@
   const AUTH_PASSWORD = "210514";
   const AUTH_SESSION_TTL = 1000 * 60 * 60 * 12;
 
+  function installApprovedHistoryWaveGlobalStubs() {
+    const globalObj = typeof window !== "undefined" ? window : globalThis;
+    if (typeof globalObj.scheduleDepositApprovedHistoryRefreshWave !== "function") {
+      globalObj.scheduleDepositApprovedHistoryRefreshWave = function scheduleDepositApprovedHistoryRefreshWaveStub() { return null; };
+    }
+    if (typeof globalObj.triggerDepositApprovedHistoryRefreshWave !== "function") {
+      globalObj.triggerDepositApprovedHistoryRefreshWave = function triggerDepositApprovedHistoryRefreshWaveStub(options = {}) {
+        try { return globalObj.scheduleDepositApprovedHistoryRefreshWave(options || {}); } catch (error) { console.warn("[PP] deposit approved wave stub failed", error); return null; }
+      };
+    }
+    if (typeof globalObj.scheduleWithdrawApprovedHistoryRefreshWave !== "function") {
+      globalObj.scheduleWithdrawApprovedHistoryRefreshWave = function scheduleWithdrawApprovedHistoryRefreshWaveStub() { return null; };
+    }
+    if (typeof globalObj.triggerWithdrawApprovedHistoryRefreshWave !== "function") {
+      globalObj.triggerWithdrawApprovedHistoryRefreshWave = function triggerWithdrawApprovedHistoryRefreshWaveStub(options = {}) {
+        try { return globalObj.scheduleWithdrawApprovedHistoryRefreshWave(options || {}); } catch (error) { console.warn("[PP] withdraw approved wave stub failed", error); return null; }
+      };
+    }
+  }
+
+  installApprovedHistoryWaveGlobalStubs();
+  const PANEL_FETCH_MARK_HEADER = "x-pp-no-observe";
+  const BANK_CODE_CACHE_KEY = "__ppBankCodeCache_v3";
+  const SERVICE_PATHS = Object.freeze({
+    depositPending: "/process/service/depositPending",
+    depositApproved: "/process/service/depositApproved",
+    depositApprovedContent: "/process/service/depositApprovedContent",
+    depositApprovedHeader: "/process/service/depositApprovedHeader",
+    withdrawPending: "/process/service/withdrawPending",
+    withdrawApprovedContent: "/process/service/withdrawApprovedContent",
+    withdrawApprovedHeader: "/process/service/withdrawApprovedHeader"
+  });
+
+  function getRuntimeOrigin() {
+    try {
+      if (window.location && /^https?:/i.test(String(window.location.origin || ""))) return String(window.location.origin);
+    } catch (_) {}
+    try {
+      const href = String(window.location && window.location.href || "");
+      if (href) return new URL(href).origin;
+    } catch (_) {}
+    return "";
+  }
+
+  function resolveServiceEndpoint(key) {
+    const path = String(SERVICE_PATHS[key] || "");
+    if (!path) return "";
+    try {
+      return new URL(path, getRuntimeOrigin() || window.location.href).toString();
+    } catch (_) {
+      return path;
+    }
+  }
+
+  const SERVICE_ENDPOINTS = Object.freeze(Object.keys(SERVICE_PATHS).reduce((acc, key) => {
+    acc[key] = resolveServiceEndpoint(key);
+    return acc;
+  }, {}));
+
+  function normalizeBankCodeList(values) {
+    const source = Array.isArray(values) ? values : [values];
+    const out = [];
+    const seen = new Set();
+    source.forEach((value) => {
+      const normalized = String(value == null ? "" : value).trim();
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      out.push(normalized);
+    });
+    return out;
+  }
+
+  function readBankCodeCache(type) {
+    const key = type === "wd" ? "wd" : "depo";
+    try {
+      const raw = JSON.parse(localStorage.getItem(BANK_CODE_CACHE_KEY) || "{}");
+      return normalizeBankCodeList(raw && raw[key]);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function writeBankCodeCache(type, values) {
+    const key = type === "wd" ? "wd" : "depo";
+    const normalized = normalizeBankCodeList(values);
+    try {
+      const raw = JSON.parse(localStorage.getItem(BANK_CODE_CACHE_KEY) || "{}");
+      raw[key] = normalized;
+      localStorage.setItem(BANK_CODE_CACHE_KEY, JSON.stringify(raw));
+    } catch (_) {}
+    return normalized;
+  }
+
+  function mergeBankCodeCache(type, values) {
+    const merged = normalizeBankCodeList([...readBankCodeCache(type), ...normalizeBankCodeList(values)]);
+    if (merged.length) writeBankCodeCache(type, merged);
+    return merged;
+  }
+
+  function getCachedBankCodeOptions(type) {
+    return readBankCodeCache(type).map((value) => ({ value, text: inferBankLabelFromValue(value) || String(value) }));
+  }
+
+  function getPanelAjaxHeaders(extra = {}) {
+    return Object.assign({ [PANEL_FETCH_MARK_HEADER]: "1" }, extra || {});
+  }
+
+  function hasObserveOptOutHeader(headers) {
+    try {
+      if (!headers) return false;
+      if (typeof Headers !== "undefined" && headers instanceof Headers) {
+        return String(headers.get(PANEL_FETCH_MARK_HEADER) || "") === "1";
+      }
+      if (Array.isArray(headers)) {
+        return headers.some((pair) => Array.isArray(pair) && String(pair[0] || "").toLowerCase() === PANEL_FETCH_MARK_HEADER && String(pair[1] || "") === "1");
+      }
+      if (typeof headers === "object") {
+        return Object.keys(headers).some((key) => String(key || "").toLowerCase() === PANEL_FETCH_MARK_HEADER && String(headers[key] || "") === "1");
+      }
+    } catch (_) {}
+    return false;
+  }
+
   function setApproveContextLocal(source, kind, id) {
     if (id == null || id === "") return null;
     const ctx = { source: String(source || ""), kind: String(kind || ""), id: String(id), ts: Date.now() };
@@ -335,6 +458,7 @@ function normalizeBankLabelKey(value) {
     fingerprints: { depo: "", wd: "" },
     signatures: { depo: "", wd: "" },
     lastLoadedAt: { depo: 0, wd: 0 },
+    lastRequestAt: { depo: 0, wd: 0 },
     autoSyncTimer: 0,
     deferredFlushTimer: 0,
     interactionLockUntil: 0,
@@ -343,8 +467,10 @@ function normalizeBankLabelKey(value) {
     destroyed: false,
     authUnlocked: false,
     mainBooted: false,
+    panelToastHideTimer: 0,
+    panelPosition: { mode: "center", left: 0, top: 0 },
     menuCloseFns: { depo: null, wd: null, depoAutoApproveLock: null },
-    drag: { active: false, startX: 0, startY: 0, left: 0, top: 0, pointerId: null },
+    drag: { active: false, startX: 0, startY: 0, left: 0, top: 0, pointerId: null, bound: false },
     lastEscShortcutAt: 0,
     lastSafeWithdrawAlertAt: 0,
     depo: {
@@ -362,7 +488,8 @@ function normalizeBankLabelKey(value) {
       hasBankSelection: false,
       responseHtml: "",
       bankCounts: {},
-      total: 0
+      total: 0,
+      approved: getDepositApprovedDefaultState()
     },
     wd: {
       showAll: true,
@@ -375,7 +502,8 @@ function normalizeBankLabelKey(value) {
       hasBankSelection: false,
       responseHtml: "",
       bankCounts: {},
-      total: 0
+      total: 0,
+      approved: getWithdrawApprovedDefaultState()
     }
   };
 
@@ -490,6 +618,61 @@ function normalizeBankLabelKey(value) {
     return !state.destroyed && !!refs.panel && document.body.contains(refs.panel);
   }
 
+  function getPanelViewportMetrics() {
+    const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+    const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+    const gapX = Math.max(6, Math.min(20, Math.round(vw * 0.01)));
+    const gapY = Math.max(8, Math.min(20, Math.round(vh * 0.014)));
+    const zoom = 1;
+    return { vw, vh, gapX, gapY, zoom };
+  }
+
+  function getPanelSizeFromViewport(vw, vh) {
+    const gapX = Math.max(8, Math.min(28, Math.round(vw * 0.014)));
+    const gapY = Math.max(8, Math.min(20, Math.round(vh * 0.014)));
+    const maxViewportWidth = Math.max(320, vw - (gapX * 2));
+    const widthCap = vw >= 2000 ? 1960 : vw >= 1700 ? 1840 : vw >= 1440 ? 1720 : vw >= 1280 ? 1600 : maxViewportWidth;
+    return {
+      width: Math.max(320, Math.min(maxViewportWidth, widthCap)),
+      height: state.minimized ? 48 : Math.max(48, vh - (gapY * 2)),
+      maxWidth: maxViewportWidth,
+      maxHeight: Math.max(48, vh - (gapY * 2))
+    };
+  }
+
+  function getSyncRequestGap(type) {
+    if (state.minimized) return type === state.activeTab ? 2200 : 4200;
+    return type === state.activeTab ? 1350 : 2600;
+  }
+
+  function showPanelToast(message, mode = "info", holdMs = 1800) {
+    if (!isPanelAlive()) return false;
+    const text = String(message || "").trim();
+    if (!text) return false;
+    let host = refs.panel.querySelector(".pp-toastHost");
+    if (!host) {
+      host = document.createElement("div");
+      host.className = "pp-toastHost";
+      host.innerHTML = '<div class="pp-toast" role="status" aria-live="polite"></div>';
+      refs.panel.appendChild(host);
+    }
+    const toast = host.querySelector(".pp-toast");
+    if (!toast) return false;
+    toast.textContent = text;
+    toast.className = `pp-toast is-show${mode ? ` is-${String(mode)}` : ""}`;
+    if (state.panelToastHideTimer) {
+      clearTimeout(state.panelToastHideTimer);
+      state.panelToastHideTimer = 0;
+    }
+    state.panelToastHideTimer = window.setTimeout(() => {
+      toast.className = "pp-toast";
+      state.panelToastHideTimer = 0;
+    }, Math.max(900, holdMs || 0));
+    return true;
+  }
+
+  window.__ppPanelToast = (message, mode, holdMs) => showPanelToast(message, mode, holdMs);
+
   refs.closeBtn.addEventListener("click", destroyPanel);
   refs.minimizeBtn.addEventListener("click", toggleMinimize);
   refs.tabs.forEach((button) => {
@@ -544,6 +727,10 @@ function normalizeBankLabelKey(value) {
   function pauseMainPanelForAuth() {
     stopAutoSync();
     clearDepositAutoApproveTimer();
+    clearDepositApprovedRefreshTimer();
+    clearDepositApprovedSyncTimers();
+    clearWithdrawApprovedRefreshTimer();
+    clearWithdrawApprovedSyncTimers();
     state.depo.autoApproveBusy = false;
     state.pendingReload.depo = false;
     state.pendingReload.wd = false;
@@ -722,16 +909,21 @@ function normalizeBankLabelKey(value) {
         --pp-radius: 3px;
         --pp-radius-sm: 2px;
         position: fixed;
-        top: 20px;
-        right: 12px;
-        width: min(1360px, calc(100vw - 24px));
-        height: min(900px, calc(100vh - 40px));
-        max-height: calc(100vh - 40px);
+        --pp-panel-gap-x: 10px;
+        --pp-panel-gap-y: 12px;
+        --pp-panel-zoom: 1;
+        top: var(--pp-panel-gap-y);
+        left: 50%;
+        width: min(1760px, calc(100vw - (var(--pp-panel-gap-x) * 2)));
+        height: calc(100vh - (var(--pp-panel-gap-y) * 2));
+        max-width: calc(100vw - (var(--pp-panel-gap-x) * 2));
+        max-height: calc(100vh - (var(--pp-panel-gap-y) * 2));
         background: #fff;
         border: 1px solid #c9d2dc;
         box-shadow: 0 20px 40px rgb(0 0 0 / 0.18);
         z-index: 2147483647;
-        transition: height .18s ease;
+        transition: width .18s ease, height .18s ease, left .18s ease, top .18s ease, transform .18s ease;
+        transform: translateX(-50%);
         overflow: hidden;
         border-radius: var(--pp-radius);
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -981,6 +1173,40 @@ function normalizeBankLabelKey(value) {
         0% { transform: translateX(0); }
         100% { transform: translateX(-50%); }
       }
+      #${PANEL_ID} .pp-toastHost {
+        position: absolute;
+        right: 14px;
+        bottom: 14px;
+        z-index: 60;
+        pointer-events: none;
+        display: flex;
+        justify-content: flex-end;
+      }
+      #${PANEL_ID} .pp-toast {
+        min-width: 220px;
+        max-width: min(420px, calc(100vw - 40px));
+        padding: 11px 14px;
+        border-radius: 10px;
+        background: rgba(17, 24, 39, 0.94);
+        color: #fff;
+        font-size: 12px;
+        line-height: 1.45;
+        box-shadow: 0 14px 36px rgba(0, 0, 0, 0.24);
+        opacity: 0;
+        transform: translateY(8px);
+        transition: opacity .18s ease, transform .18s ease;
+        backdrop-filter: blur(6px);
+      }
+      #${PANEL_ID} .pp-toast.is-show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      #${PANEL_ID} .pp-toast.is-warn {
+        background: rgba(126, 34, 79, 0.96);
+      }
+      #${PANEL_ID} .pp-toast.is-success {
+        background: rgba(22, 101, 52, 0.95);
+      }
       @media (prefers-reduced-motion: reduce) {
         #${PANEL_ID},
         #${PANEL_ID} *,
@@ -1140,7 +1366,8 @@ function normalizeBankLabelKey(value) {
         padding: 14px;
       }
       #${PANEL_ID}.is-minimized {
-        height: 43px;
+        height: 48px;
+        min-height: 48px;
       }
       #${PANEL_ID}.is-minimized .pp-content {
         display: none;
@@ -1200,6 +1427,184 @@ function normalizeBankLabelKey(value) {
       }
       #${PANEL_ID} .pp-filterBar {
         position: relative;
+      }
+      #${PANEL_ID} .pp-approvedToolbar {
+        display: inline-flex;
+        align-items: center;
+        gap: 0;
+        flex-wrap: wrap;
+      }
+      #${PANEL_ID} .pp-approvedToolbar label {
+        margin: 0;
+      }
+      #${PANEL_ID} .pp-approvedToolbar .pp-approvedLabel {
+        display: inline-flex;
+        align-items: center;
+        font-size: 13px;
+        line-height: 1;
+        margin: 0;
+      }
+      #${PANEL_ID} .pp-approvedDateInput {
+        width: 110px !important;
+        min-width: 110px;
+        margin-left: 10px;
+        height: 34px;
+        padding: 6px 10px;
+        font-size: 13px;
+      }
+      #${PANEL_ID} .pp-approvedDateInput.is-from {
+        margin-right: 10px;
+      }
+      #${PANEL_ID} .pp-approvedDateInput.is-to {
+        margin-right: 0;
+      }
+      #${PANEL_ID} .pp-approvedSearchField {
+        width: auto !important;
+        min-width: 180px;
+        margin-right: 0;
+        vertical-align: middle;
+      }
+      #${PANEL_ID} .pp-approvedToolbar:not(.pp-approvedToolbarBottom) .btn {
+        margin-left: 10px;
+      }
+      #${PANEL_ID} .pp-approvedToolbarBottom {
+        display: inline-flex;
+        align-items: center;
+        gap: 0;
+        flex-wrap: nowrap;
+      }
+      #${PANEL_ID} .pp-approvedToolbarBottom .form-control,
+      #${PANEL_ID} .pp-approvedToolbarBottom .form-select,
+      #${PANEL_ID} .pp-approvedToolbarBottom .btn {
+        display: inline-block;
+        vertical-align: middle;
+      }
+      #${PANEL_ID} .pp-approvedToolbarBottom .btn + .btn {
+        margin-left: 10px;
+      }
+      #${PANEL_ID} #ppWdApprovedShowAll {
+        margin: 0;
+        vertical-align: middle;
+      }
+      #${PANEL_ID} .pp-approvedShowAllLabel {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin: 0;
+        line-height: 1.2;
+      }
+      #${PANEL_ID} .pp-approvedHistoryWrap {
+        margin-top: 16px;
+      }
+      #${PANEL_ID} .pp-approvedHistorySurface {
+        border: 1px solid #d8dee6;
+        background: #fff;
+        overflow: hidden;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner {
+        padding: 0;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner > .table-responsive,
+      #${PANEL_ID} .pp-approvedHistoryInner > .tableWrap,
+      #${PANEL_ID} .pp-approvedHistoryInner > .pp-tableWrap {
+        margin: 0;
+        border: 0;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .table,
+      #${PANEL_ID} .pp-approvedHistoryInner table {
+        width: 100%;
+        margin: 0;
+        border-collapse: separate;
+        border-spacing: 0;
+        background: #fff;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner table thead th,
+      #${PANEL_ID} .pp-approvedHistoryInner table thead td {
+        background: #f7f8fa;
+        color: #374151;
+        font-weight: 700;
+        border-bottom: 1px solid #dde3ea;
+        white-space: nowrap;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner table th,
+      #${PANEL_ID} .pp-approvedHistoryInner table td {
+        padding: 10px 12px;
+        vertical-align: middle;
+        border-top: 0;
+        border-bottom: 1px solid #edf1f5;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner table tbody tr:last-child td {
+        border-bottom: 0;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner table tbody tr:hover {
+        background: #fafbfc;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination,
+      #${PANEL_ID} .pp-approvedHistoryInner ul.pagination {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin: 0;
+        padding: 12px;
+        list-style: none;
+        border-top: 1px solid #edf1f5;
+        background: #fff;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination li,
+      #${PANEL_ID} .pp-approvedHistoryInner ul.pagination li {
+        margin: 0;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination a,
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination button,
+      #${PANEL_ID} .pp-approvedHistoryInner [data-pp-approved-page] {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 34px;
+        height: 32px;
+        padding: 0 10px;
+        border: 1px solid #d1d5db;
+        background: #fff;
+        color: #374151;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination .active a,
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination .active span,
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination .active button,
+      #${PANEL_ID} .pp-approvedHistoryInner [data-pp-approved-page].is-active {
+        background: #7e224f;
+        border-color: #7e224f;
+        color: #fff;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .well,
+      #${PANEL_ID} .pp-approvedHistoryInner .alert {
+        margin: 0;
+        border-left: 0;
+        border-right: 0;
+        border-radius: 0 !important;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .text-danger,
+      #${PANEL_ID} .pp-approvedHistoryInner .label-danger {
+        color: #b91c1c;
+      }
+      @media (max-width: 860px) {
+        #${PANEL_ID} .pp-approvedToolbar {
+          width: 100%;
+          justify-content: flex-start;
+          gap: 8px;
+        }
+        #${PANEL_ID} .pp-approvedDateInput,
+        #${PANEL_ID} .pp-approvedSearchField {
+          width: 100% !important;
+          min-width: 0;
+          margin-left: 0;
+          margin-right: 0;
+        }
+        #${PANEL_ID} .pp-approvedToolbarBottom {
+          flex-wrap: wrap;
+        }
       }
       #${PANEL_ID} .pp-bankMenuWrap {
         position: relative;
@@ -1368,7 +1773,7 @@ function normalizeBankLabelKey(value) {
         font-size: 15px;
       }
       #${PANEL_ID} .pp-navItem {
-        min-height: 46px;
+        min-height: 44px;
         padding: 0 16px;
         font-size: 13px;
       }
@@ -1379,7 +1784,7 @@ function normalizeBankLabelKey(value) {
         font-size: 22px;
       }
       #${PANEL_ID} .pp-bankSummary {
-        gap: 10px;
+        gap: 12px;
         min-height: 24px;
       }
       #${PANEL_ID} .btn,
@@ -1403,7 +1808,7 @@ function normalizeBankLabelKey(value) {
       }
       #${PANEL_ID} .form-control,
       #${PANEL_ID} .form-select {
-        min-height: 36px;
+        min-height: 34px;
       }
       #${PANEL_ID} .pp-previewValue,
       #${PANEL_ID} .pp-userMuted,
@@ -1412,6 +1817,53 @@ function normalizeBankLabelKey(value) {
       #${PANEL_ID} .pp-colSectionTitle,
       #${PANEL_ID} .pp-userField label {
         font-size: 13px !important;
+      }
+      #${PANEL_ID} .pp-tableWrap table {
+        min-width: 100%;
+      }
+      #${PANEL_ID} .table th,
+      #${PANEL_ID} .table td,
+      #${PANEL_ID} table th,
+      #${PANEL_ID} table td {
+        padding: 8px 10px !important;
+        vertical-align: middle;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        align-items: center !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+        column-gap: 8px;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > [class*="col"] {
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto {
+        flex: 0 0 auto;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .btn,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .form-control,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .form-select,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .form-check-input {
+        vertical-align: middle;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .form-check-input {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+        align-self: center;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .btn-success,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center .btn.btn-success {
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        white-space: nowrap;
       }
       #${PANEL_ID}, #${PANEL_ID} * {
         scrollbar-width: none;
@@ -1528,7 +1980,25 @@ function normalizeBankLabelKey(value) {
   function renderSectionIntoTab(type, parsed) {
     const tab = type === "depo" ? refs.depoTab : refs.wdTab;
     const snapshot = captureTabUiState(type, tab);
-    tab.innerHTML = buildSectionMarkup(type, parsed);
+    const markup = buildSectionMarkup(type, parsed);
+    const currentMain = tab.querySelector(`#ppSectionMain-${type}`);
+    const currentApproved = tab.querySelector(`#ppSectionApproved-${type}`);
+
+    if (currentMain && currentApproved) {
+      const shell = document.createElement("div");
+      shell.innerHTML = markup;
+      const nextMain = shell.querySelector(`#ppSectionMain-${type}`);
+      if (nextMain) currentMain.replaceWith(nextMain);
+      if (!tab.querySelector(`#ppSectionApproved-${type}`)) {
+        const nextApproved = shell.querySelector(`#ppSectionApproved-${type}`);
+        if (nextApproved) tab.appendChild(nextApproved);
+      }
+    } else {
+      tab.innerHTML = markup;
+      tab.__ppDepoApprovedControlsBound = false;
+      tab.__ppWdApprovedControlsBound = false;
+    }
+
     tab.dataset.rendered = "1";
     bindSection(type);
     restoreTabUiState(type, tab, snapshot);
@@ -1560,16 +2030,16 @@ function normalizeBankLabelKey(value) {
       const sinceInteraction = now - (state.lastInteractionAt || 0);
       const fastDepositAutoApprove = activeType === "depo" && state.depo.autoApprove;
       const activeMinAge = state.minimized
-        ? (fastDepositAutoApprove ? 4800 : 8200)
-        : (fastDepositAutoApprove ? (sinceInteraction < 3200 ? 900 : 1200) : (sinceInteraction < 3200 ? 1900 : 2800));
+        ? (fastDepositAutoApprove ? 6500 : 9800)
+        : (fastDepositAutoApprove ? (sinceInteraction < 3200 ? 1500 : 1900) : (sinceInteraction < 3200 ? 2600 : 3600));
       const secondaryMinAge = state.minimized
-        ? 18000
-        : (fastDepositAutoApprove ? (sinceInteraction < 3200 ? 3000 : 3600) : (sinceInteraction < 3200 ? 4200 : 5600));
+        ? 24000
+        : (fastDepositAutoApprove ? (sinceInteraction < 3200 ? 5200 : 6800) : (sinceInteraction < 3200 ? 6200 : 7800));
       const nextDelay = state.minimized
-        ? (fastDepositAutoApprove ? 1450 : 3200)
+        ? (fastDepositAutoApprove ? 2200 : 4200)
         : (fastDepositAutoApprove
-            ? (sinceInteraction < 2200 ? 950 : 1150)
-            : (sinceInteraction < 2200 ? 1200 : 1450));
+            ? (sinceInteraction < 2200 ? 1450 : 1650)
+            : (sinceInteraction < 2200 ? 1650 : 2100));
 
       maybeAutoRefresh(activeType, now, activeMinAge);
       if (!state.minimized && state.initialized[secondaryType]) {
@@ -1602,6 +2072,7 @@ function normalizeBankLabelKey(value) {
     if (state.loading[type]) return;
     if (!state.initialized[type] && type !== state.activeTab) return;
     if (isInteractionLocked(type)) return;
+    if (now - (state.lastRequestAt[type] || 0) < getSyncRequestGap(type)) return;
     if (now - (state.lastLoadedAt[type] || 0) < minAge) return;
     loadSection(type, { busyText: "Syncing...", silent: true });
   }
@@ -1616,7 +2087,7 @@ function normalizeBankLabelKey(value) {
       state.pendingReload[activeType] = true;
       return;
     }
-    const staleAge = (activeType === "depo" && state.depo.autoApprove) ? 650 : 1200;
+    const staleAge = (activeType === "depo" && state.depo.autoApprove) ? 1400 : 2200;
     if (forceRefresh || (Date.now() - (state.lastLoadedAt[activeType] || 0) > staleAge)) {
       loadSection(activeType, { busyText: "Syncing...", silent: true });
     }
@@ -1660,6 +2131,11 @@ function normalizeBankLabelKey(value) {
     const cfg = state[type];
     const hasRendered = tab.dataset.rendered === "1" && tab.innerHTML.trim();
     const previousHeight = Math.max(tab.offsetHeight || 0, 220);
+    const requestGap = options.initial ? 0 : (options.silent ? getSyncRequestGap(type) : 420);
+    const nowTs = Date.now();
+    if (hasRendered && !options.force && (nowTs - (state.lastRequestAt[type] || 0) < requestGap)) {
+      return false;
+    }
     const token = ++state.loadToken[type];
     const currentController = state.abortControllers[type];
 
@@ -1671,6 +2147,7 @@ function normalizeBankLabelKey(value) {
     state.abortControllers[type] = controller;
     state.loading[type] = true;
     state.pendingReload[type] = false;
+    state.lastRequestAt[type] = nowTs;
 
     if (hasRendered) {
       tab.style.minHeight = `${previousHeight}px`;
@@ -1764,14 +2241,16 @@ function normalizeBankLabelKey(value) {
     const merged = dedupeBankOptions([...(cfg.availableBanks || []), ...nativeBanks, ...rowBanks]);
     if (merged.length) {
       cfg.availableBanks = merged;
+      mergeBankCodeCache(type, merged.map((item) => item && item.value));
       const helpers = ensureSharedBankHelpers();
       helpers.getLabelByValue = function (kind, value) {
         const current = getAvailableBanks(kind);
         const match = current.find((item) => String(item.value) === String(value));
         return match ? match.text : "";
       };
+      return cfg.availableBanks || [];
     }
-    return cfg.availableBanks || [];
+    return getCachedBankCodeOptions(type);
   }
 
   function syncBankSelection(type, availableBanks) {
@@ -1796,7 +2275,8 @@ function normalizeBankLabelKey(value) {
     const availableValues = available.map((item) => String(item.value)).filter(Boolean);
     const selectedValues = (cfg.banks || []).map((value) => String(value)).filter(Boolean);
     const values = cfg.hasBankSelection ? selectedValues : availableValues;
-    return [...new Set(values)];
+    const unique = [...new Set(values)];
+    return unique.length ? mergeBankCodeCache(type, unique) : readBankCodeCache(type);
   }
 
   function lookupBankLabel(type, value, extras = []) {
@@ -1873,6 +2353,1197 @@ function normalizeBankLabelKey(value) {
     };
   }
 
+  function getLocalDateOnly(date = new Date()) {
+    const value = date instanceof Date ? new Date(date.getTime()) : new Date(date);
+    if (Number.isNaN(value.getTime())) return "";
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const day = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+
+  function getDepositApprovedDefaultState() {
+    const currentDate = new Date();
+    const sevenDaysAgo = new Date(currentDate.getTime());
+    sevenDaysAgo.setDate(currentDate.getDate() - 7);
+    return {
+      showAll: true,
+      from: getLocalDateOnly(sevenDaysAgo),
+      to: getLocalDateOnly(currentDate),
+      form: "username",
+      val: "",
+      indicator: "",
+      page: 1,
+      html: "",
+      initialized: false,
+      loading: false,
+      abortController: null,
+      refreshTimer: 0,
+      syncTimers: [],
+      renderedHtml: "",
+      loadingMode: "idle"
+    };
+  }
+
+  function ensureDepositApprovedState() {
+    const cfg = state.depo;
+    if (!cfg.approved || typeof cfg.approved !== "object") {
+      cfg.approved = getDepositApprovedDefaultState();
+      return cfg.approved;
+    }
+    const defaults = getDepositApprovedDefaultState();
+    cfg.approved.showAll = !!cfg.approved.showAll;
+    cfg.approved.from = String(cfg.approved.from || defaults.from);
+    cfg.approved.to = String(cfg.approved.to || defaults.to);
+    cfg.approved.form = ["username", "name", "rekening", "note"].includes(String(cfg.approved.form || "")) ? String(cfg.approved.form) : "username";
+    cfg.approved.val = String(cfg.approved.val || "");
+    cfg.approved.indicator = ["", "n", "g", "y", "r"].includes(String(cfg.approved.indicator || "")) ? String(cfg.approved.indicator) : "";
+    cfg.approved.page = Math.max(1, parseInt(cfg.approved.page, 10) || 1);
+    cfg.approved.html = String(cfg.approved.html || "");
+    cfg.approved.initialized = !!cfg.approved.initialized;
+    cfg.approved.loading = !!cfg.approved.loading;
+    cfg.approved.abortController = cfg.approved.abortController || null;
+    cfg.approved.refreshTimer = Number(cfg.approved.refreshTimer || 0) || 0;
+    cfg.approved.syncTimers = Array.isArray(cfg.approved.syncTimers) ? cfg.approved.syncTimers.filter((value) => Number.isFinite(Number(value))) : [];
+    cfg.approved.renderedHtml = String(cfg.approved.renderedHtml || "");
+    cfg.approved.loadingMode = String(cfg.approved.loadingMode || "idle");
+    return cfg.approved;
+  }
+
+  function clearDepositApprovedRefreshTimer() {
+    const approved = ensureDepositApprovedState();
+    if (approved.refreshTimer) {
+      try { clearTimeout(approved.refreshTimer); } catch (_) {}
+      approved.refreshTimer = 0;
+    }
+  }
+
+  function clearDepositApprovedSyncTimers() {
+    const approved = ensureDepositApprovedState();
+    const timers = Array.isArray(approved.syncTimers) ? approved.syncTimers.slice() : [];
+    approved.syncTimers = [];
+    timers.forEach((timer) => {
+      try { clearTimeout(timer); } catch (_) {}
+    });
+  }
+
+
+  function extractApprovedBankOptionsFromHtml(type, html) {
+    const source = String(html || "").trim();
+    if (!source) return [];
+    let doc = null;
+    try {
+      doc = new DOMParser().parseFromString(source, "text/html");
+    } catch (_) {
+      return [];
+    }
+    if (!doc) return [];
+
+    const optionSelectors = type === "depo"
+      ? [
+          "#bank-select-depo option",
+          "#bank-select option",
+          "select[name='listRekening[]'] option",
+          "select[name='listRekening'] option",
+          "select[id*='bank'] option",
+          "select[id*='rekening'] option"
+        ]
+      : [
+          "#bank-select option",
+          "#bank-select-depo option",
+          "select[name='listRekening[]'] option",
+          "select[name='listRekening'] option",
+          "select[id*='bank'] option",
+          "select[id*='rekening'] option"
+        ];
+
+    const inputSelectors = [
+      "input[name='listRekening[]'][value]",
+      "input[name='listRekening'][value]",
+      "input[id*='rekening'][value]",
+      "input[data-bank][value]"
+    ];
+
+    const options = [];
+    optionSelectors.forEach((selector) => {
+      doc.querySelectorAll(selector).forEach((node) => {
+        const value = String(node.value || node.getAttribute("value") || "").trim();
+        if (!value) return;
+        const textLabel = String(node.textContent || node.label || "").replace(/\s+/g, " ").trim();
+        options.push({ value, text: textLabel || inferBankLabelFromValue(value) });
+      });
+    });
+
+    inputSelectors.forEach((selector) => {
+      doc.querySelectorAll(selector).forEach((node) => {
+        const value = String(node.value || node.getAttribute("value") || "").trim();
+        if (!value) return;
+        const labelNode = node.closest("label");
+        const parentText = labelNode ? labelNode.textContent : ((node.parentElement && node.parentElement.textContent) || "");
+        const textLabel = String(parentText || node.getAttribute("data-bank") || "").replace(/\s+/g, " ").trim();
+        options.push({ value, text: textLabel || inferBankLabelFromValue(value) });
+      });
+    });
+
+    return dedupeBankOptions(options);
+  }
+
+  function resolveApprovedBankOptions(type, headerHtml = "") {
+    const cfg = getStateSection(type);
+    const merged = dedupeBankOptions([
+      ...extractApprovedBankOptionsFromHtml(type, headerHtml),
+      ...collectBanksFromNativeDom(type),
+      ...(cfg.availableBanks || []),
+      ...getAvailableBanks(type),
+      ...getCachedBankCodeOptions(type)
+    ]);
+    if (merged.length) {
+      cfg.availableBanks = merged.slice();
+      mergeBankCodeCache(type, merged.map((item) => item && item.value));
+    }
+    return merged;
+  }
+
+  async function fetchApprovedHeaderHtml(type, signal) {
+    const approved = type === "depo" ? ensureDepositApprovedState() : ensureWithdrawApprovedState();
+    const endpoint = type === "depo"
+      ? SERVICE_ENDPOINTS.depositApprovedHeader
+      : SERVICE_ENDPOINTS.withdrawApprovedHeader;
+
+    const headers = getPanelAjaxHeaders({
+      accept: "*/*",
+      "x-requested-with": "XMLHttpRequest"
+    });
+
+    let body = null;
+    if (type === "wd") {
+      headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8";
+      const params = new URLSearchParams();
+      params.append("showAll", approved.showAll ? "true" : "false");
+      params.append("withdrawFrom", String(approved.from || ""));
+      params.append("withdrawTo", String(approved.to || ""));
+      params.append("withdrawForm", String(approved.form || "username"));
+      params.append("withdrawVal", String(approved.val || ""));
+      body = params.toString();
+    }
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      credentials: "include",
+      cache: "no-store",
+      signal,
+      headers,
+      body
+    });
+
+    if (!response.ok) {
+      throw new Error(`${type === "depo" ? "Deposit" : "Withdraw"} approved header request failed: ${response.status}`);
+    }
+
+    return response.text();
+  }
+
+  async function fetchDepositApprovedHistory(cfg, signal, page) {
+    const approved = ensureDepositApprovedState();
+    const request = createFetchSignal(signal, 15000);
+    const currentPage = Math.max(1, parseInt(page, 10) || approved.page || 1);
+    let headerHtml = "";
+    try {
+      headerHtml = await fetchApprovedHeaderHtml("depo", request.signal);
+    } catch (error) {
+      if (!(error && error.name === "AbortError")) {
+        console.warn(`[${PANEL_ID}] deposit approved header fetch failed`, error);
+      }
+    }
+    const bankCodes = resolveApprovedBankOptions("depo", headerHtml).map((item) => String(item.value)).filter(Boolean);
+
+    const primaryBody = new URLSearchParams();
+    bankCodes.forEach((value) => primaryBody.append("listRekening[]", value));
+    primaryBody.append("showAll", approved.showAll ? "true" : "false");
+    primaryBody.append("catBy", String(approved.form || "username"));
+    primaryBody.append("catValue", String(approved.val || ""));
+    primaryBody.append("indicator", String(approved.indicator || ""));
+    primaryBody.append("startDate", String(approved.from || ""));
+    primaryBody.append("endDate", String(approved.to || ""));
+    primaryBody.append("page", String(currentPage));
+    primaryBody.append("dpp", "40");
+
+    const fallbackBody = new URLSearchParams(primaryBody.toString());
+    fallbackBody.append("depoAppDtStart", String(approved.from || ""));
+    fallbackBody.append("depoAppDtEnd", String(approved.to || ""));
+    fallbackBody.append("depoAppCatBy", String(approved.form || "username"));
+    fallbackBody.append("depoAppCatValue", String(approved.val || ""));
+    fallbackBody.append("depoAppIndicator", String(approved.indicator || ""));
+    fallbackBody.append("depositFrom", String(approved.from || ""));
+    fallbackBody.append("depositTo", String(approved.to || ""));
+    fallbackBody.append("depositForm", String(approved.form || "username"));
+    fallbackBody.append("depositVal", String(approved.val || ""));
+    fallbackBody.append("depositIndicator", String(approved.indicator || ""));
+
+    const attempts = [
+      {
+        endpoint: SERVICE_ENDPOINTS.depositApproved,
+        body: primaryBody.toString()
+      },
+      {
+        endpoint: SERVICE_ENDPOINTS.depositApprovedContent,
+        body: fallbackBody.toString()
+      }
+    ];
+
+    try {
+      let lastError = null;
+      for (const attempt of attempts) {
+        try {
+          const response = await fetch(attempt.endpoint, {
+            method: "POST",
+            credentials: "include",
+            cache: "no-store",
+            signal: request.signal,
+            headers: getPanelAjaxHeaders({
+              accept: "*/*",
+              "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "x-requested-with": "XMLHttpRequest"
+            }),
+            body: attempt.body
+          });
+
+          if (!response.ok) {
+            lastError = new Error(`Deposit approved request failed: ${response.status}`);
+            continue;
+          }
+
+          return response.text();
+        } catch (error) {
+          if (error && error.name === "AbortError") throw error;
+          lastError = error;
+        }
+      }
+      throw lastError || new Error("Deposit approved request failed");
+    } finally {
+      request.cleanup();
+    }
+  }
+
+  function extractDepositApprovedPage(source) {
+    const text = String(source || "");
+    const match = text.match(/menuDepositApproved\(\s*[^,]*,\s*(\d+)\s*\)/i);
+    return match ? Math.max(1, parseInt(match[1], 10) || 1) : 0;
+  }
+
+  function sanitizeDepositApprovedHtml(html) {
+    const doc = new DOMParser().parseFromString(`<div id="ppDepositApprovedRoot">${html}</div>`, "text/html");
+    const wrapper = doc.getElementById("ppDepositApprovedRoot") || doc.body;
+    const section = wrapper.querySelector("#contentDepositApproved2, #contentDepositApproved, #contentDepoApproved, #headerDepoApproved") || wrapper;
+
+    section.querySelectorAll("script").forEach((node) => node.remove());
+
+    const filterAlerts = [...section.querySelectorAll(".alert")].filter((node) => node.querySelector("#depoAppDtStart, #depoAppDtEnd, #depoAppCatBy, #depoAppCatValue, #depositApprovedAll, #depoAppIndicator"));
+    filterAlerts.forEach((node) => node.remove());
+
+    [...section.querySelectorAll("#depoAppDtStart, #depoAppDtEnd, #depoAppCatBy, #depoAppCatValue, #depositApprovedAll, #depoAppIndicator")].forEach((node) => {
+      const wrap = node.closest(".alert") || node.closest(".row") || node.closest("div");
+      if (wrap && wrap !== section) wrap.remove();
+    });
+
+    section.querySelectorAll("[onclick], a[href], button[href]").forEach((node) => {
+      const onclick = node.getAttribute("onclick") || "";
+      const href = node.getAttribute("href") || "";
+      const page = extractDepositApprovedPage(onclick) || extractDepositApprovedPage(href);
+      if (page) {
+        node.setAttribute("data-pp-depo-approved-page", String(page));
+        node.style.cursor = "pointer";
+      }
+      if (/resetFormApproved/i.test(onclick) || /resetFormApproved/i.test(href)) {
+        node.setAttribute("data-pp-depo-approved-clear", "1");
+        node.style.cursor = "pointer";
+      }
+      if (node.hasAttribute("onclick")) node.removeAttribute("onclick");
+      if (/^javascript:/i.test(href)) node.setAttribute("href", "#");
+    });
+
+    const content = section.innerHTML.trim();
+    return content || '<div class="pp-empty">Tidak ada history deposit approved.</div>';
+  }
+
+  function renderDepositApprovedBody(content) {
+    const inner = String(content || '').trim() || '<div class="pp-empty">Tidak ada history deposit approved.</div>';
+    return `<div class="pp-approvedHistorySurface"><div class="pp-approvedHistoryInner">${inner}</div></div>`;
+  }
+
+  function buildDepositApprovedMarkup() {
+    const approved = ensureDepositApprovedState();
+    const bodyHtml = renderDepositApprovedBody(approved.html
+      ? sanitizeDepositApprovedHtml(approved.html)
+      : '<div class="pp-empty">Belum ada history deposit approved.</div>');
+
+    return `
+      <div class="pp-sectionBody" style="margin-top:22px;">
+        <div class="alert alert-success pp-alert" style="margin-bottom:0;border-color:#d6e9c6;border-radius:4px 4px 0 0 !important;">
+          <div class="row align-items-center">
+            <div class="col">
+              <strong><span class="glyphicon glyphicon-tasks"></span> DEPOSIT APPROVED</strong>
+            </div>
+            <div class="col-auto">
+              <span class="pull-right form-group-sm form-inline pp-approvedToolbar">
+                <label for="ppDepoApprovedFrom" class="pp-approvedLabel"><strong>From</strong></label>
+                <input type="text" class="form-control form-select datepicker pp-approvedDateInput is-from" id="ppDepoApprovedFrom" value="${escapeHtml(approved.from)}" placeholder="yyyy-mm-dd" inputmode="numeric" spellcheck="false">
+                <label for="ppDepoApprovedTo" class="pp-approvedLabel"><strong>To</strong></label>
+                <input type="text" class="form-control form-select datepicker pp-approvedDateInput is-to" id="ppDepoApprovedTo" value="${escapeHtml(approved.to)}" placeholder="Now" inputmode="numeric" spellcheck="false">
+                <button type="button" class="btn btn-secondary" id="ppDepoApprovedSearchTop">Search</button>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="alert alert-success pp-filterBar" style="background-color:#F9F9F9;margin-top:0;border-radius:0 0 4px 4px !important;border-color:#d6e9c6;">
+          <div class="row align-items-center">
+            <div class="col">
+              <input class="form-check-input" type="checkbox" value="" id="ppDepoApprovedShowAll" ${approved.showAll ? "checked" : ""}>
+              <label class="form-check-label pp-approvedShowAllLabel" for="ppDepoApprovedShowAll">
+                <strong>Show All Transactions</strong>
+              </label>
+            </div>
+            <div class="col-auto">
+              <span class="pull-right form-group-sm form-inline pp-approvedToolbar pp-approvedToolbarBottom">
+                <select id="ppDepoApprovedForm" class="form-control form-select" style="margin-left:10px;display:inline-block;vertical-align:middle;">
+                  <option value="username" ${approved.form === "username" ? "selected" : ""}>Username</option>
+                  <option value="name" ${approved.form === "name" ? "selected" : ""}>Nama Rekening</option>
+                  <option value="rekening" ${approved.form === "rekening" ? "selected" : ""}>Nomor Rekening</option>
+                  <option value="note" ${approved.form === "note" ? "selected" : ""}>Deskripsi</option>
+                </select>
+                <input type="text" id="ppDepoApprovedVal" class="form-control pp-approvedSearchField" value="${escapeHtml(approved.val)}" style="display:inline-block;vertical-align:middle;margin-left:10px;" placeholder="">
+                <button type="button" class="btn btn-secondary" id="ppDepoApprovedSearchBottom" style="margin-left:10px">Search</button>
+                <select id="ppDepoApprovedIndicator" class="form-control form-select" style="margin-left:15px;margin-right:15px;display:inline-block;vertical-align:middle;">
+                  <option value="" ${approved.indicator === "" ? "selected" : ""}>All Indicator</option>
+                  <option value="n" ${approved.indicator === "n" ? "selected" : ""}>None Only</option>
+                  <option value="g" ${approved.indicator === "g" ? "selected" : ""}>Green Only</option>
+                  <option value="y" ${approved.indicator === "y" ? "selected" : ""}>Yellow Only</option>
+                  <option value="r" ${approved.indicator === "r" ? "selected" : ""}>Red Only</option>
+                </select>
+                <button type="button" class="btn btn-secondary" id="ppDepoApprovedClear">Reset Form</button>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div id="ppDepoApprovedBody" class="pp-approvedHistoryWrap">${bodyHtml}</div>
+      </div>
+    `;
+  }
+
+  function syncDepositApprovedControls(tab) {
+    const approved = ensureDepositApprovedState();
+    if (!tab) return;
+    const body = tab.querySelector("#ppDepoApprovedBody");
+    const searchButtons = [tab.querySelector("#ppDepoApprovedSearchTop"), tab.querySelector("#ppDepoApprovedSearchBottom")].filter(Boolean);
+    const clearButton = tab.querySelector("#ppDepoApprovedClear");
+    const inputs = [
+      tab.querySelector("#ppDepoApprovedShowAll"),
+      tab.querySelector("#ppDepoApprovedFrom"),
+      tab.querySelector("#ppDepoApprovedTo"),
+      tab.querySelector("#ppDepoApprovedForm"),
+      tab.querySelector("#ppDepoApprovedVal"),
+      tab.querySelector("#ppDepoApprovedIndicator")
+    ].filter(Boolean);
+    const hardBusy = !!approved.loading && approved.loadingMode !== "silent";
+
+    inputs.forEach((input) => {
+      input.disabled = hardBusy;
+    });
+
+    searchButtons.forEach((button) => {
+      button.disabled = hardBusy;
+      button.textContent = "Search";
+      button.classList.toggle("is-loading", !!approved.loading);
+    });
+
+    if (clearButton) clearButton.disabled = hardBusy;
+    if (body) {
+      body.setAttribute("aria-busy", approved.loading ? "true" : "false");
+      body.dataset.syncMode = approved.loading ? approved.loadingMode : "idle";
+    }
+  }
+
+  function initDepositApprovedDatepickers(tab) {
+    if (!tab || tab.__ppDepoApprovedDatepickerBound) return;
+    tab.__ppDepoApprovedDatepickerBound = true;
+    const dateNodes = [...tab.querySelectorAll("#ppDepoApprovedFrom, #ppDepoApprovedTo")];
+    if (!dateNodes.length) return;
+    const jq = window.jQuery || window.$;
+    if (!jq || typeof jq.fn !== "object" || typeof jq.fn.datepicker !== "function") return;
+    try {
+      jq(dateNodes).datepicker({
+        format: "yyyy-mm-dd",
+        todayHighlight: true,
+        autoclose: true
+      });
+    } catch (_) {}
+  }
+
+  function readDepositApprovedControls(tab) {
+    const approved = ensureDepositApprovedState();
+    if (!tab) return approved;
+    const showAllInput = tab.querySelector("#ppDepoApprovedShowAll");
+    const fromInput = tab.querySelector("#ppDepoApprovedFrom");
+    const toInput = tab.querySelector("#ppDepoApprovedTo");
+    const formSelect = tab.querySelector("#ppDepoApprovedForm");
+    const valueInput = tab.querySelector("#ppDepoApprovedVal");
+    const indicatorSelect = tab.querySelector("#ppDepoApprovedIndicator");
+
+    approved.showAll = !!(showAllInput && showAllInput.checked);
+    approved.from = normalizeApprovedDateValue(fromInput && fromInput.value, approved.from || getLocalDateOnly(new Date()));
+    approved.to = normalizeApprovedDateValue(toInput && toInput.value, approved.to || getLocalDateOnly(new Date()));
+    if (fromInput) fromInput.value = approved.from;
+    if (toInput) toInput.value = approved.to;
+    approved.form = String(formSelect && formSelect.value || approved.form || "username");
+    approved.val = String(valueInput && valueInput.value || "").trim();
+    approved.indicator = ["", "n", "g", "y", "r"].includes(String(indicatorSelect && indicatorSelect.value || approved.indicator || "")) ? String(indicatorSelect && indicatorSelect.value || approved.indicator || "") : "";
+    return approved;
+  }
+
+  function scheduleDepositApprovedHistoryRefresh(delay = 650, options = {}) {
+    const approved = ensureDepositApprovedState();
+    clearDepositApprovedRefreshTimer();
+    approved.refreshTimer = window.setTimeout(() => {
+      approved.refreshTimer = 0;
+      if (!isPanelAlive() || !isAuthenticated()) return;
+      loadDepositApprovedHistory({
+        page: Math.max(1, parseInt(options.page, 10) || approved.page || 1),
+        forceBusy: !!options.forceBusy,
+        silent: !!options.silent,
+        busyText: options.busyText || "Refreshing deposit approved..."
+      }).catch((error) => console.error(`[${PANEL_ID}] deposit approved refresh failed`, error));
+    }, Math.max(0, delay || 0));
+    return approved.refreshTimer;
+  }
+
+  function scheduleDepositApprovedHistoryRefreshWave(options = {}) {
+    const approved = ensureDepositApprovedState();
+    const delays = Array.isArray(options.delays) && options.delays.length ? options.delays : [350, 1200, 2600, 4300, 6800, 9400];
+    clearDepositApprovedRefreshTimer();
+    clearDepositApprovedSyncTimers();
+    delays.forEach((delay, index) => {
+      const timer = window.setTimeout(() => {
+        const current = ensureDepositApprovedState();
+        if (!isPanelAlive() || !isAuthenticated()) return;
+        if (current.loading) {
+          scheduleDepositApprovedHistoryRefresh(260, {
+            page: options.page,
+            forceBusy: false,
+            silent: true,
+            busyText: options.busyText || "Refreshing deposit approved..."
+          });
+          return;
+        }
+        loadDepositApprovedHistory({
+          page: Math.max(1, parseInt(options.page, 10) || current.page || approved.page || 1),
+          forceBusy: !!(options.forceBusy && index === 0),
+          silent: options.silent !== false,
+          busyText: options.busyText || "Refreshing deposit approved..."
+        }).catch((error) => console.error(`[${PANEL_ID}] deposit approved wave refresh failed`, error));
+      }, Math.max(0, delay || 0));
+      approved.syncTimers.push(timer);
+    });
+    return approved.syncTimers.slice();
+  }
+
+  function triggerDepositApprovedHistoryRefreshWave(options = {}) {
+    const localWave = typeof scheduleDepositApprovedHistoryRefreshWave === "function" ? scheduleDepositApprovedHistoryRefreshWave : null;
+    const globalWave = typeof window.scheduleDepositApprovedHistoryRefreshWave === "function" ? window.scheduleDepositApprovedHistoryRefreshWave : null;
+    const runner = localWave || globalWave;
+    if (typeof runner === "function") {
+      try {
+        return runner(options || {});
+      } catch (error) {
+        console.warn(`[${PANEL_ID}] deposit approved wave bridge failed`, error);
+      }
+    }
+    return scheduleDepositApprovedHistoryRefresh(360, {
+      page: options && options.page,
+      forceBusy: !!(options && options.forceBusy),
+      silent: !(options && options.forceBusy),
+      busyText: options && options.busyText || "Refreshing deposit approved..."
+    });
+  }
+
+  window.scheduleDepositApprovedHistoryRefreshWave = function scheduleDepositApprovedHistoryRefreshWaveGlobal(options = {}) {
+    return scheduleDepositApprovedHistoryRefreshWave(options || {});
+  };
+  window.triggerDepositApprovedHistoryRefreshWave = function triggerDepositApprovedHistoryRefreshWaveGlobal(options = {}) {
+    return triggerDepositApprovedHistoryRefreshWave(options || {});
+  };
+
+  async function loadDepositApprovedHistory(options = {}) {
+    if (!isPanelAlive() || !isAuthenticated()) return false;
+    const tab = refs.depoTab;
+    if (!tab) return false;
+
+    const approved = readDepositApprovedControls(tab);
+    const body = tab.querySelector("#ppDepoApprovedBody");
+    const requestedPage = Math.max(1, parseInt(options.page, 10) || approved.page || 1);
+    const silent = !!options.silent;
+
+    if (approved.abortController) {
+      try { approved.abortController.abort(); } catch (_) {}
+    }
+
+    const controller = new AbortController();
+    approved.abortController = controller;
+    approved.loading = true;
+    approved.loadingMode = silent ? "silent" : "busy";
+    approved.page = requestedPage;
+    syncDepositApprovedControls(tab);
+
+    if (body && (!approved.html || (options.forceBusy && !silent))) {
+      const loadingMarkup = renderDepositApprovedBody(`<div class="pp-loading">${escapeHtml(options.busyText || "Loading deposit approved...")}</div>`);
+      if (loadingMarkup !== approved.renderedHtml) {
+        body.innerHTML = loadingMarkup;
+        approved.renderedHtml = loadingMarkup;
+      }
+    }
+
+    try {
+      const html = await fetchDepositApprovedHistory(state.depo, controller.signal, requestedPage);
+      if (approved.abortController !== controller) return false;
+      approved.html = String(html || "");
+      approved.initialized = true;
+      const nextMarkup = renderDepositApprovedBody(sanitizeDepositApprovedHtml(approved.html));
+      if (body && nextMarkup !== approved.renderedHtml) {
+        body.innerHTML = nextMarkup;
+        approved.renderedHtml = nextMarkup;
+      }
+      return true;
+    } catch (error) {
+      if (error && error.name === "AbortError") return false;
+      console.error(`[${PANEL_ID}] deposit approved load failed`, error);
+      const errorMarkup = renderDepositApprovedBody('<div class="pp-error">Gagal memuat history deposit approved</div>');
+      if (body && errorMarkup !== approved.renderedHtml) {
+        body.innerHTML = errorMarkup;
+        approved.renderedHtml = errorMarkup;
+      }
+      return false;
+    } finally {
+      if (approved.abortController === controller) {
+        approved.abortController = null;
+      }
+      approved.loading = false;
+      approved.loadingMode = "idle";
+      syncDepositApprovedControls(tab);
+    }
+  }
+
+  function bindDepositApprovedControls(tab) {
+    if (!tab || tab.__ppDepoApprovedControlsBound) return;
+    tab.__ppDepoApprovedControlsBound = true;
+    initDepositApprovedDatepickers(tab);
+    const approved = ensureDepositApprovedState();
+    const showAllInput = tab.querySelector("#ppDepoApprovedShowAll");
+    const fromInput = tab.querySelector("#ppDepoApprovedFrom");
+    const toInput = tab.querySelector("#ppDepoApprovedTo");
+    const formSelect = tab.querySelector("#ppDepoApprovedForm");
+    const valueInput = tab.querySelector("#ppDepoApprovedVal");
+    const indicatorSelect = tab.querySelector("#ppDepoApprovedIndicator");
+    const searchButtons = [tab.querySelector("#ppDepoApprovedSearchTop"), tab.querySelector("#ppDepoApprovedSearchBottom")].filter(Boolean);
+    const clearButton = tab.querySelector("#ppDepoApprovedClear");
+    const body = tab.querySelector("#ppDepoApprovedBody");
+
+    const runSearch = (page = 1, forceBusy = false) => {
+      approved.page = Math.max(1, parseInt(page, 10) || 1);
+      loadDepositApprovedHistory({ page: approved.page, forceBusy, busyText: approved.initialized ? "Refreshing history..." : "Loading deposit approved..." });
+    };
+
+    if (showAllInput) {
+      showAllInput.checked = !!approved.showAll;
+      showAllInput.addEventListener("change", () => runSearch(1, true));
+    }
+
+    [fromInput, toInput, formSelect, indicatorSelect].filter(Boolean).forEach((input) => {
+      input.addEventListener("change", () => {
+        readDepositApprovedControls(tab);
+        if (input === indicatorSelect) runSearch(1, true);
+      });
+    });
+
+    [fromInput, toInput].filter(Boolean).forEach((input) => {
+      input.addEventListener("blur", () => {
+        const fallback = input === fromInput ? approved.from : approved.to;
+        input.value = normalizeApprovedDateValue(input.value, fallback);
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          runSearch(1, true);
+        }
+      });
+    });
+
+    if (valueInput) {
+      valueInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          runSearch(1, true);
+        }
+      });
+      valueInput.addEventListener("input", () => {
+        approved.val = String(valueInput.value || "");
+      });
+    }
+
+    searchButtons.forEach((button) => {
+      button.addEventListener("click", () => runSearch(1, true));
+    });
+
+    if (clearButton) {
+      clearButton.addEventListener("click", () => {
+        clearDepositApprovedRefreshTimer();
+        clearDepositApprovedSyncTimers();
+        const defaults = getDepositApprovedDefaultState();
+        Object.assign(approved, defaults, { html: "", initialized: false, loading: false, loadingMode: "idle", renderedHtml: "", abortController: null });
+        if (showAllInput) showAllInput.checked = !!approved.showAll;
+        if (fromInput) fromInput.value = approved.from;
+        if (toInput) toInput.value = approved.to;
+        if (formSelect) formSelect.value = approved.form;
+        if (valueInput) valueInput.value = approved.val;
+        if (indicatorSelect) indicatorSelect.value = approved.indicator;
+        if (body) body.innerHTML = renderDepositApprovedBody('<div class="pp-loading">Loading deposit approved...</div>');
+        runSearch(1, true);
+      });
+    }
+
+    if (body && !body.__ppDepoApprovedBound) {
+      body.__ppDepoApprovedBound = true;
+      body.addEventListener("click", (event) => {
+        const clearTrigger = event.target.closest("[data-pp-depo-approved-clear='1']");
+        if (clearTrigger) {
+          event.preventDefault();
+          if (clearButton) clearButton.click();
+          return;
+        }
+        const pageTrigger = event.target.closest("[data-pp-depo-approved-page]");
+        if (!pageTrigger) return;
+        event.preventDefault();
+        const nextPage = Math.max(1, parseInt(pageTrigger.getAttribute("data-pp-depo-approved-page") || "1", 10) || 1);
+        runSearch(nextPage, true);
+      });
+    }
+
+    syncDepositApprovedControls(tab);
+    if (!approved.initialized && !approved.loading) {
+      loadDepositApprovedHistory({ page: approved.page || 1, busyText: "Loading deposit approved..." });
+    }
+  }
+
+  function getWithdrawApprovedDefaultState() {
+    const currentDate = new Date();
+    const sevenDaysAgo = new Date(currentDate.getTime());
+    sevenDaysAgo.setDate(currentDate.getDate() - 7);
+    return {
+      showAll: true,
+      from: getLocalDateOnly(sevenDaysAgo),
+      to: getLocalDateOnly(currentDate),
+      form: "username",
+      val: "",
+      page: 1,
+      html: "",
+      initialized: false,
+      loading: false,
+      abortController: null,
+      refreshTimer: 0,
+      syncTimers: [],
+      renderedHtml: "",
+      loadingMode: "idle"
+    };
+  }
+
+  function ensureWithdrawApprovedState() {
+    const cfg = state.wd;
+    if (!cfg.approved || typeof cfg.approved !== "object") {
+      cfg.approved = getWithdrawApprovedDefaultState();
+      return cfg.approved;
+    }
+    const defaults = getWithdrawApprovedDefaultState();
+    cfg.approved.showAll = !!cfg.approved.showAll;
+    cfg.approved.from = String(cfg.approved.from || defaults.from);
+    cfg.approved.to = String(cfg.approved.to || defaults.to);
+    cfg.approved.form = ["username", "name", "rekening", "note"].includes(String(cfg.approved.form || "")) ? String(cfg.approved.form) : "username";
+    cfg.approved.val = String(cfg.approved.val || "");
+    cfg.approved.page = Math.max(1, parseInt(cfg.approved.page, 10) || 1);
+    cfg.approved.html = String(cfg.approved.html || "");
+    cfg.approved.initialized = !!cfg.approved.initialized;
+    cfg.approved.loading = !!cfg.approved.loading;
+    cfg.approved.abortController = cfg.approved.abortController || null;
+    cfg.approved.refreshTimer = Number(cfg.approved.refreshTimer || 0) || 0;
+    cfg.approved.syncTimers = Array.isArray(cfg.approved.syncTimers) ? cfg.approved.syncTimers.filter((value) => Number.isFinite(Number(value))) : [];
+    cfg.approved.renderedHtml = String(cfg.approved.renderedHtml || "");
+    cfg.approved.loadingMode = String(cfg.approved.loadingMode || "idle");
+    return cfg.approved;
+  }
+
+  function clearWithdrawApprovedRefreshTimer() {
+    const approved = ensureWithdrawApprovedState();
+    if (approved.refreshTimer) {
+      try { clearTimeout(approved.refreshTimer); } catch (_) {}
+      approved.refreshTimer = 0;
+    }
+  }
+
+  function clearWithdrawApprovedSyncTimers() {
+    const approved = ensureWithdrawApprovedState();
+    const timers = Array.isArray(approved.syncTimers) ? approved.syncTimers.slice() : [];
+    approved.syncTimers = [];
+    timers.forEach((timer) => {
+      try { clearTimeout(timer); } catch (_) {}
+    });
+  }
+
+  async function fetchWithdrawApprovedHistory(cfg, signal, page) {
+    const approved = ensureWithdrawApprovedState();
+    const body = new URLSearchParams();
+    const request = createFetchSignal(signal, 15000);
+    let headerHtml = "";
+    try {
+      headerHtml = await fetchApprovedHeaderHtml("wd", request.signal);
+    } catch (error) {
+      if (!(error && error.name === "AbortError")) {
+        console.warn(`[${PANEL_ID}] withdraw approved header fetch failed`, error);
+      }
+    }
+    const bankCodes = resolveApprovedBankOptions("wd", headerHtml).map((item) => String(item.value)).filter(Boolean);
+    bankCodes.forEach((value) => body.append("listRekening[]", value));
+    body.append("showAll", approved.showAll ? "1" : "0");
+    body.append("withdrawFrom", String(approved.from || ""));
+    body.append("withdrawTo", String(approved.to || ""));
+    body.append("withdrawForm", String(approved.form || "username"));
+    body.append("withdrawVal", String(approved.val || ""));
+    body.append("page", String(Math.max(1, parseInt(page, 10) || approved.page || 1)));
+
+    try {
+      const response = await fetch(SERVICE_ENDPOINTS.withdrawApprovedContent, {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        signal: request.signal,
+        headers: getPanelAjaxHeaders({
+          accept: "*/*",
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "x-requested-with": "XMLHttpRequest"
+        }),
+        body: body.toString()
+      });
+
+      if (!response.ok) {
+        throw new Error(`Withdraw approved request failed: ${response.status}`);
+      }
+
+      return response.text();
+    } finally {
+      request.cleanup();
+    }
+  }
+
+  function extractWithdrawApprovedPage(source) {
+    const text = String(source || "");
+    const match = text.match(/menuWithdrawApprovedContent\(\s*[^,]*,\s*(\d+)\s*\)/i);
+    return match ? Math.max(1, parseInt(match[1], 10) || 1) : 0;
+  }
+
+  function sanitizeWithdrawApprovedHtml(html) {
+    const doc = new DOMParser().parseFromString(`<div id="ppWithdrawApprovedRoot">${html}</div>`, "text/html");
+    const wrapper = doc.getElementById("ppWithdrawApprovedRoot") || doc.body;
+    const section = wrapper.querySelector("#contentWithdrawApproved2, #contentWithdrawApproved, #contentWD2") || wrapper;
+
+    section.querySelectorAll("script").forEach((node) => node.remove());
+
+    const filterAlerts = [...section.querySelectorAll(".alert")].filter((node) => node.querySelector("#withdrawFrom, #withdrawTo, #withdrawForm, #withdrawVal, #withdrawApprovedAll"));
+    filterAlerts.forEach((node) => node.remove());
+
+    [...section.querySelectorAll("#withdrawFrom, #withdrawTo, #withdrawForm, #withdrawVal, #withdrawApprovedAll")].forEach((node) => {
+      const wrap = node.closest(".alert") || node.closest(".row") || node.closest("div");
+      if (wrap && wrap !== section) wrap.remove();
+    });
+
+    section.querySelectorAll("[onclick], a[href], button[href]").forEach((node) => {
+      const onclick = node.getAttribute("onclick") || "";
+      const href = node.getAttribute("href") || "";
+      const page = extractWithdrawApprovedPage(onclick) || extractWithdrawApprovedPage(href);
+      if (page) {
+        node.setAttribute("data-pp-approved-page", String(page));
+        node.style.cursor = "pointer";
+      }
+      if (/clearFormApproved/i.test(onclick) || /clearFormApproved/i.test(href)) {
+        node.setAttribute("data-pp-approved-clear", "1");
+        node.style.cursor = "pointer";
+      }
+      if (node.hasAttribute("onclick")) node.removeAttribute("onclick");
+      if (/^javascript:/i.test(href)) node.setAttribute("href", "#");
+    });
+
+    const content = section.innerHTML.trim();
+    return content || '<div class="pp-empty">Tidak ada history withdraw approved.</div>';
+  }
+
+  function renderWithdrawApprovedBody(content) {
+    const inner = String(content || '').trim() || '<div class="pp-empty">Tidak ada history withdraw approved.</div>';
+    return `<div class="pp-approvedHistorySurface"><div class="pp-approvedHistoryInner">${inner}</div></div>`;
+  }
+
+  function buildWithdrawApprovedMarkup() {
+    const approved = ensureWithdrawApprovedState();
+    const bodyHtml = approved.html
+      ? renderWithdrawApprovedBody(sanitizeWithdrawApprovedHtml(approved.html))
+      : renderWithdrawApprovedBody('<div class="pp-empty">Belum ada history withdraw approved.</div>');
+
+    return `
+      <div class="pp-sectionBody" style="margin-top:22px;">
+        <div class="alert alert-danger pp-alert" style="margin-bottom:0;border-color:#eed3d7;border-radius:4px 4px 0 0 !important;">
+          <div class="row align-items-center">
+            <div class="col">
+              <strong><span class="glyphicon glyphicon-tasks"></span> WITHDRAW APPROVED</strong>
+            </div>
+            <div class="col-auto">
+              <span class="pull-right form-group-sm form-inline pp-approvedToolbar">
+                <label for="ppWdApprovedFrom" class="pp-approvedLabel"><strong>From</strong></label>
+                <input type="text" class="form-control form-select datepicker pp-approvedDateInput is-from" id="ppWdApprovedFrom" value="${escapeHtml(approved.from)}" placeholder="yyyy-mm-dd" inputmode="numeric" spellcheck="false">
+                <label for="ppWdApprovedTo" class="pp-approvedLabel"><strong>To</strong></label>
+                <input type="text" class="form-control form-select datepicker pp-approvedDateInput is-to" id="ppWdApprovedTo" value="${escapeHtml(approved.to)}" placeholder="Now" inputmode="numeric" spellcheck="false">
+                <button type="button" class="btn btn-secondary" id="ppWdApprovedSearchTop">Search</button>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="alert alert-danger pp-filterBar" style="background-color:#F9F9F9;margin-top:0;border-radius:0 0 4px 4px !important;border-color:#d6e9c6;">
+          <div class="row align-items-center">
+            <div class="col">
+              <input class="form-check-input" type="checkbox" value="" id="ppWdApprovedShowAll" ${approved.showAll ? "checked" : ""}>
+              <label class="form-check-label pp-approvedShowAllLabel" for="ppWdApprovedShowAll">
+                <strong>Show All Transactions</strong>
+              </label>
+            </div>
+            <div class="col-auto">
+              <span class="pull-right form-group-sm form-inline pp-approvedToolbar pp-approvedToolbarBottom">
+                <select id="ppWdApprovedForm" class="form-control form-select" style="margin-left:10px;display:inline-block;vertical-align:middle;">
+                  <option value="username" ${approved.form === "username" ? "selected" : ""}>Username</option>
+                  <option value="name" ${approved.form === "name" ? "selected" : ""}>Nama Rekening</option>
+                  <option value="rekening" ${approved.form === "rekening" ? "selected" : ""}>Nomor Rekening</option>
+                  <option value="note" ${approved.form === "note" ? "selected" : ""}>Deskripsi</option>
+                </select>
+                <input type="text" id="ppWdApprovedVal" class="form-control pp-approvedSearchField" value="${escapeHtml(approved.val)}" style="display:inline-block;vertical-align:middle;margin-left:10px;" placeholder="">
+                <button type="button" class="btn btn-secondary" id="ppWdApprovedSearchBottom" style="margin-left:10px">Search</button>
+                <button type="button" class="btn btn-secondary" id="ppWdApprovedClear" style="margin-left:10px">Clear Form</button>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div id="ppWdApprovedBody" class="pp-approvedHistoryWrap">${bodyHtml}</div>
+      </div>
+    `;
+  }
+
+  function syncWithdrawApprovedControls(tab) {
+    const approved = ensureWithdrawApprovedState();
+    if (!tab) return;
+    const body = tab.querySelector("#ppWdApprovedBody");
+    const searchButtons = [tab.querySelector("#ppWdApprovedSearchTop"), tab.querySelector("#ppWdApprovedSearchBottom")].filter(Boolean);
+    const clearButton = tab.querySelector("#ppWdApprovedClear");
+    const inputs = [
+      tab.querySelector("#ppWdApprovedShowAll"),
+      tab.querySelector("#ppWdApprovedFrom"),
+      tab.querySelector("#ppWdApprovedTo"),
+      tab.querySelector("#ppWdApprovedForm"),
+      tab.querySelector("#ppWdApprovedVal")
+    ].filter(Boolean);
+    const hardBusy = !!approved.loading && approved.loadingMode !== "silent";
+
+    inputs.forEach((input) => {
+      input.disabled = hardBusy;
+    });
+
+    searchButtons.forEach((button) => {
+      button.disabled = hardBusy;
+      button.textContent = "Search";
+      button.classList.toggle("is-loading", !!approved.loading);
+    });
+
+    if (clearButton) clearButton.disabled = hardBusy;
+    if (body) {
+      body.setAttribute("aria-busy", approved.loading ? "true" : "false");
+      body.dataset.syncMode = approved.loading ? approved.loadingMode : "idle";
+    }
+  }
+
+  function normalizeApprovedDateValue(value, fallback = "") {
+    const raw = String(value || "").trim();
+    if (!raw) return String(fallback || "");
+    const normalized = raw.replace(/[./]/g, "-");
+    if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return normalized;
+    const parsed = new Date(normalized);
+    return Number.isNaN(parsed.getTime()) ? String(fallback || "") : getLocalDateOnly(parsed);
+  }
+
+  function initWithdrawApprovedDatepickers(tab) {
+    if (!tab || tab.__ppWdApprovedDatepickerBound) return;
+    tab.__ppWdApprovedDatepickerBound = true;
+    const dateNodes = [...tab.querySelectorAll("#ppWdApprovedFrom, #ppWdApprovedTo")];
+    if (!dateNodes.length) return;
+    const jq = window.jQuery || window.$;
+    if (!jq || typeof jq.fn !== "object" || typeof jq.fn.datepicker !== "function") return;
+    try {
+      jq(dateNodes).datepicker({
+        format: "yyyy-mm-dd",
+        todayHighlight: true,
+        autoclose: true
+      });
+    } catch (_) {}
+  }
+
+  function readWithdrawApprovedControls(tab) {
+    const approved = ensureWithdrawApprovedState();
+    if (!tab) return approved;
+    const showAllInput = tab.querySelector("#ppWdApprovedShowAll");
+    const fromInput = tab.querySelector("#ppWdApprovedFrom");
+    const toInput = tab.querySelector("#ppWdApprovedTo");
+    const formSelect = tab.querySelector("#ppWdApprovedForm");
+    const valueInput = tab.querySelector("#ppWdApprovedVal");
+
+    approved.showAll = !!(showAllInput && showAllInput.checked);
+    approved.from = normalizeApprovedDateValue(fromInput && fromInput.value, approved.from || getLocalDateOnly(new Date()));
+    approved.to = normalizeApprovedDateValue(toInput && toInput.value, approved.to || getLocalDateOnly(new Date()));
+    if (fromInput) fromInput.value = approved.from;
+    if (toInput) toInput.value = approved.to;
+    approved.form = String(formSelect && formSelect.value || approved.form || "username");
+    approved.val = String(valueInput && valueInput.value || "").trim();
+    return approved;
+  }
+
+  function scheduleWithdrawApprovedHistoryRefresh(delay = 650, options = {}) {
+    const approved = ensureWithdrawApprovedState();
+    clearWithdrawApprovedRefreshTimer();
+    approved.refreshTimer = window.setTimeout(() => {
+      approved.refreshTimer = 0;
+      if (!isPanelAlive() || !isAuthenticated()) return;
+      loadWithdrawApprovedHistory({
+        page: Math.max(1, parseInt(options.page, 10) || approved.page || 1),
+        forceBusy: !!options.forceBusy,
+        silent: !!options.silent,
+        busyText: options.busyText || "Refreshing withdraw approved..."
+      }).catch((error) => console.error(`[${PANEL_ID}] withdraw approved refresh failed`, error));
+    }, Math.max(0, delay || 0));
+    return approved.refreshTimer;
+  }
+
+  function scheduleWithdrawApprovedHistoryRefreshWave(options = {}) {
+    const approved = ensureWithdrawApprovedState();
+    const delays = Array.isArray(options.delays) && options.delays.length ? options.delays : [350, 1200, 2600, 4300, 6800, 9400];
+    clearWithdrawApprovedRefreshTimer();
+    clearWithdrawApprovedSyncTimers();
+    delays.forEach((delay, index) => {
+      const timer = window.setTimeout(() => {
+        const current = ensureWithdrawApprovedState();
+        if (!isPanelAlive() || !isAuthenticated()) return;
+        if (current.loading) {
+          scheduleWithdrawApprovedHistoryRefresh(260, {
+            page: options.page,
+            forceBusy: false,
+            silent: true,
+            busyText: options.busyText || "Refreshing withdraw approved..."
+          });
+          return;
+        }
+        loadWithdrawApprovedHistory({
+          page: Math.max(1, parseInt(options.page, 10) || current.page || approved.page || 1),
+          forceBusy: !!(options.forceBusy && index === 0),
+          silent: options.silent !== false,
+          busyText: options.busyText || "Refreshing withdraw approved..."
+        }).catch((error) => console.error(`[${PANEL_ID}] withdraw approved wave refresh failed`, error));
+      }, Math.max(0, delay || 0));
+      approved.syncTimers.push(timer);
+    });
+    return approved.syncTimers.slice();
+  }
+
+  function triggerWithdrawApprovedHistoryRefreshWave(options = {}) {
+    const localWave = typeof scheduleWithdrawApprovedHistoryRefreshWave === "function" ? scheduleWithdrawApprovedHistoryRefreshWave : null;
+    const globalWave = typeof window.scheduleWithdrawApprovedHistoryRefreshWave === "function" ? window.scheduleWithdrawApprovedHistoryRefreshWave : null;
+    const runner = localWave || globalWave;
+    if (typeof runner === "function") {
+      try {
+        return runner(options || {});
+      } catch (error) {
+        console.warn(`[${PANEL_ID}] withdraw approved wave bridge failed`, error);
+      }
+    }
+    return scheduleWithdrawApprovedHistoryRefresh(360, {
+      page: options && options.page,
+      forceBusy: !!(options && options.forceBusy),
+      silent: !(options && options.forceBusy),
+      busyText: options && options.busyText || "Refreshing withdraw approved..."
+    });
+  }
+
+  window.scheduleWithdrawApprovedHistoryRefreshWave = function scheduleWithdrawApprovedHistoryRefreshWaveGlobal(options = {}) {
+    return scheduleWithdrawApprovedHistoryRefreshWave(options || {});
+  };
+  window.triggerWithdrawApprovedHistoryRefreshWave = function triggerWithdrawApprovedHistoryRefreshWaveGlobal(options = {}) {
+    return triggerWithdrawApprovedHistoryRefreshWave(options || {});
+  };
+
+  async function loadWithdrawApprovedHistory(options = {}) {
+    if (!isPanelAlive() || !isAuthenticated()) return false;
+    const tab = refs.wdTab;
+    if (!tab) return false;
+
+    const approved = readWithdrawApprovedControls(tab);
+    const body = tab.querySelector("#ppWdApprovedBody");
+    const requestedPage = Math.max(1, parseInt(options.page, 10) || approved.page || 1);
+    const silent = !!options.silent;
+
+    if (approved.abortController) {
+      try { approved.abortController.abort(); } catch (_) {}
+    }
+
+    const controller = new AbortController();
+    approved.abortController = controller;
+    approved.loading = true;
+    approved.loadingMode = silent ? "silent" : "busy";
+    approved.page = requestedPage;
+    syncWithdrawApprovedControls(tab);
+
+    if (body && (!approved.html || (options.forceBusy && !silent))) {
+      const loadingMarkup = renderWithdrawApprovedBody(`<div class="pp-loading">${escapeHtml(options.busyText || "Loading withdraw approved...")}</div>`);
+      if (loadingMarkup !== approved.renderedHtml) {
+        body.innerHTML = loadingMarkup;
+        approved.renderedHtml = loadingMarkup;
+      }
+    }
+
+    try {
+      const html = await fetchWithdrawApprovedHistory(state.wd, controller.signal, requestedPage);
+      if (approved.abortController !== controller) return false;
+      approved.html = String(html || "");
+      approved.initialized = true;
+      const nextMarkup = renderWithdrawApprovedBody(sanitizeWithdrawApprovedHtml(approved.html));
+      if (body && nextMarkup !== approved.renderedHtml) {
+        body.innerHTML = nextMarkup;
+        approved.renderedHtml = nextMarkup;
+      }
+      return true;
+    } catch (error) {
+      if (error && error.name === "AbortError") return false;
+      console.error(`[${PANEL_ID}] withdraw approved load failed`, error);
+      const errorMarkup = renderWithdrawApprovedBody('<div class="pp-error">Gagal memuat history withdraw approved</div>');
+      if (body && errorMarkup !== approved.renderedHtml) {
+        body.innerHTML = errorMarkup;
+        approved.renderedHtml = errorMarkup;
+      }
+      return false;
+    } finally {
+      if (approved.abortController === controller) {
+        approved.abortController = null;
+      }
+      approved.loading = false;
+      approved.loadingMode = "idle";
+      syncWithdrawApprovedControls(tab);
+    }
+  }
+
+  function bindWithdrawApprovedControls(tab) {
+    if (!tab || tab.__ppWdApprovedControlsBound) return;
+    tab.__ppWdApprovedControlsBound = true;
+    initWithdrawApprovedDatepickers(tab);
+    const approved = ensureWithdrawApprovedState();
+    const showAllInput = tab.querySelector("#ppWdApprovedShowAll");
+    const fromInput = tab.querySelector("#ppWdApprovedFrom");
+    const toInput = tab.querySelector("#ppWdApprovedTo");
+    const formSelect = tab.querySelector("#ppWdApprovedForm");
+    const valueInput = tab.querySelector("#ppWdApprovedVal");
+    const searchButtons = [tab.querySelector("#ppWdApprovedSearchTop"), tab.querySelector("#ppWdApprovedSearchBottom")].filter(Boolean);
+    const clearButton = tab.querySelector("#ppWdApprovedClear");
+    const body = tab.querySelector("#ppWdApprovedBody");
+
+    const runSearch = (page = 1, forceBusy = false) => {
+      approved.page = Math.max(1, parseInt(page, 10) || 1);
+      loadWithdrawApprovedHistory({ page: approved.page, forceBusy, busyText: approved.initialized ? "Refreshing history..." : "Loading withdraw approved..." });
+    };
+
+    if (showAllInput) {
+      showAllInput.checked = !!approved.showAll;
+      showAllInput.addEventListener("change", () => runSearch(1, true));
+    }
+
+    [fromInput, toInput, formSelect].filter(Boolean).forEach((input) => {
+      input.addEventListener("change", () => {
+        readWithdrawApprovedControls(tab);
+      });
+    });
+
+    [fromInput, toInput].filter(Boolean).forEach((input) => {
+      input.addEventListener("blur", () => {
+        const fallback = input === fromInput ? approved.from : approved.to;
+        input.value = normalizeApprovedDateValue(input.value, fallback);
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          runSearch(1, true);
+        }
+      });
+    });
+
+    if (valueInput) {
+      valueInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          runSearch(1, true);
+        }
+      });
+      valueInput.addEventListener("input", () => {
+        approved.val = String(valueInput.value || "");
+      });
+    }
+
+    searchButtons.forEach((button) => {
+      button.addEventListener("click", () => runSearch(1, true));
+    });
+
+    if (clearButton) {
+      clearButton.addEventListener("click", () => {
+        clearWithdrawApprovedRefreshTimer();
+        clearWithdrawApprovedSyncTimers();
+        const defaults = getWithdrawApprovedDefaultState();
+        Object.assign(approved, defaults, { html: "", initialized: false, loading: false, loadingMode: "idle", renderedHtml: "", abortController: null });
+        if (showAllInput) showAllInput.checked = !!approved.showAll;
+        if (fromInput) fromInput.value = approved.from;
+        if (toInput) toInput.value = approved.to;
+        if (formSelect) formSelect.value = approved.form;
+        if (valueInput) valueInput.value = approved.val;
+        if (body) body.innerHTML = '<div class="pp-loading">Loading withdraw approved...</div>';
+        runSearch(1, true);
+      });
+    }
+
+    if (body && !body.__ppWdApprovedBound) {
+      body.__ppWdApprovedBound = true;
+      body.addEventListener("click", (event) => {
+        const clearTrigger = event.target.closest("[data-pp-approved-clear='1']");
+        if (clearTrigger) {
+          event.preventDefault();
+          if (clearButton) clearButton.click();
+          return;
+        }
+        const pageTrigger = event.target.closest("[data-pp-approved-page]");
+        if (!pageTrigger) return;
+        event.preventDefault();
+        const nextPage = Math.max(1, parseInt(pageTrigger.getAttribute("data-pp-approved-page") || "1", 10) || 1);
+        runSearch(nextPage, true);
+      });
+    }
+
+    syncWithdrawApprovedControls(tab);
+    if (!approved.initialized && !approved.loading) {
+      loadWithdrawApprovedHistory({ page: approved.page || 1, busyText: "Loading withdraw approved..." });
+    }
+  }
+
   async function fetchPendingDeposit(cfg, signal) {
     const body = new URLSearchParams();
     getFetchBankCodes("depo").forEach((value) => body.append("listRekening[]", value));
@@ -1881,16 +3552,16 @@ function normalizeBankLabelKey(value) {
 
     const request = createFetchSignal(signal, 12000);
     try {
-      const response = await fetch("https://admsrt74adm.com/process/service/depositPending", {
+      const response = await fetch(SERVICE_ENDPOINTS.depositPending, {
         method: "POST",
         credentials: "include",
         cache: "no-store",
         signal: request.signal,
-        headers: {
+        headers: getPanelAjaxHeaders({
           accept: "*/*",
           "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
           "x-requested-with": "XMLHttpRequest"
-        },
+        }),
         body: body.toString()
       });
 
@@ -1913,16 +3584,16 @@ function normalizeBankLabelKey(value) {
 
     const request = createFetchSignal(signal, 12000);
     try {
-      const response = await fetch("https://admsrt74adm.com/process/service/withdrawPending", {
+      const response = await fetch(SERVICE_ENDPOINTS.withdrawPending, {
         method: "POST",
         credentials: "include",
         cache: "no-store",
         signal: request.signal,
-        headers: {
+        headers: getPanelAjaxHeaders({
           accept: "*/*",
           "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
           "x-requested-with": "XMLHttpRequest"
-        },
+        }),
         body: body.toString()
       });
 
@@ -2084,63 +3755,67 @@ function normalizeBankLabelKey(value) {
     const bodyHtml = parsed.visibleTotal
       ? `${parsed.actionHtml ? `<div class="pp-actionWrap">${parsed.actionHtml}</div>` : ""}<div class="pp-tableWrap">${parsed.tableHtml}</div>`
       : `<div class="pp-empty">${cfg.hasBankSelection ? `Tidak ada pending ${isDeposit ? "deposit" : "withdraw"} pada filter bank` : `Tidak ada pending ${isDeposit ? "deposit" : "withdraw"}`}</div>`;
+    const approvedHistoryHtml = isDeposit ? buildDepositApprovedMarkup() : buildWithdrawApprovedMarkup();
 
     return `
-      <div class="pp-sectionHeader">
-        <div class="pp-row" style="margin-bottom:10px;">
-          <div class="col"><h3>${isDeposit ? "Deposit" : "Withdraw"}</h3></div>
-          ${isDeposit ? `<div class="pp-rowPush"><button type="button" class="btn btn-info" id="ppOpenMutasiBtn"><span class="glyphicon glyphicon-folder-open me-1"></span> Open Mutasi Window</button></div>` : ""}
-        </div>
-        <div class="alert ${isDeposit ? "alert-success" : "alert-danger"} pp-alert" style="border-color:${isDeposit ? "#d6e9c6" : "#eed3d7"};margin-bottom:0;${!isDeposit ? "margin-top:8px;" : ""}">
-          <div class="pp-row">
-            <div><strong><span class="glyphicon glyphicon-tasks"></span> ${isDeposit ? "DEPOSIT IN PROGRESS" : "WITHDRAW IN PROGRESS"}</strong></div>
-            <div class="pp-rowPush pp-row">
-              ${isDeposit ? `<label style="display:flex;align-items:center;gap:8px;margin:0;font-size:12px;font-weight:700"><input type="checkbox" id="ppDepoAutoApprove" ${cfg.autoApprove ? "checked" : ""}> Mode Auto Approve</label><span><strong>Lock Deposit</strong></span><div class="pp-bankMenuWrap"><button type="button" class="btn btn-secondary" id="ppDepoAutoApproveLockToggle" style="min-width:138px">${escapeHtml(autoApproveLockLabel)}</button><div class="pp-bankMenu pp-autoApproveLockMenu" id="ppDepoAutoApproveLockMenu"><div class="pp-bankMenuTools"><button type="button" class="btn btn-xs btn-secondary" data-auto-lock-action="all">All</button><button type="button" class="btn btn-xs btn-secondary" data-auto-lock-action="none">None</button><button type="button" class="btn btn-xs btn-primary" data-auto-lock-action="apply">Apply</button></div><div class="pp-bankMenuList"><label class="pp-bankOption"><input type="checkbox" id="ppDepoAutoApproveLockAll"> <span>Select all</span></label>${autoApproveLockOptions.map((item) => `<label class="pp-bankOption"><input type="checkbox" data-auto-lock-key="1" value="${escapeHtml(item.value)}" ${cfg.autoApproveLocks.includes(item.value) ? "checked" : ""}> <span>${escapeHtml(item.text)}</span></label>`).join("")}</div></div></div>` : `<label style="display:flex;align-items:center;gap:8px;margin:0;font-size:12px;font-weight:700"><input type="checkbox" id="ppWdQueueMode" ${cfg.queueMode ? "checked" : ""}> Mode Safe Withdraw</label><span><strong>Show Pending Forms</strong></span><select class="form-control form-select" id="ppWdLimit" style="width:100px;display:inline-block"><option value="999999">All</option><option value="100">100</option><option value="200">200</option><option value="300">300</option></select>`}
-              <span><strong>Sort By</strong></span>
-              <select class="form-control form-select" id="${isDeposit ? "ppDepoSort" : "ppWdSort"}" style="width:100px;display:inline-block">
-                <option value="date">Tanggal</option>
-                <option value="bank">Bank</option>
-                <option value="jumlah">Jumlah</option>
-              </select>
+      <div class="pp-mainSection" id="ppSectionMain-${type}">
+        <div class="pp-sectionHeader">
+          <div class="pp-row" style="margin-bottom:10px;">
+            <div class="col"><h3>${isDeposit ? "Deposit" : "Withdraw"}</h3></div>
+            ${isDeposit ? `<div class="pp-rowPush"><button type="button" class="btn btn-info" id="ppOpenMutasiBtn"><span class="glyphicon glyphicon-folder-open me-1"></span> Open Mutasi Window</button></div>` : ""}
+          </div>
+          <div class="alert ${isDeposit ? "alert-success" : "alert-danger"} pp-alert" style="border-color:${isDeposit ? "#d6e9c6" : "#eed3d7"};margin-bottom:0;${!isDeposit ? "margin-top:8px;" : ""}">
+            <div class="pp-row">
+              <div><strong><span class="glyphicon glyphicon-tasks"></span> ${isDeposit ? "DEPOSIT IN PROGRESS" : "WITHDRAW IN PROGRESS"}</strong></div>
+              <div class="pp-rowPush pp-row">
+                ${isDeposit ? `<label style="display:flex;align-items:center;gap:8px;margin:0;font-size:12px;font-weight:700"><input type="checkbox" id="ppDepoAutoApprove" ${cfg.autoApprove ? "checked" : ""}> Mode Auto Approve</label><span><strong>Lock Deposit</strong></span><div class="pp-bankMenuWrap"><button type="button" class="btn btn-secondary" id="ppDepoAutoApproveLockToggle" style="min-width:138px">${escapeHtml(autoApproveLockLabel)}</button><div class="pp-bankMenu pp-autoApproveLockMenu" id="ppDepoAutoApproveLockMenu"><div class="pp-bankMenuTools"><button type="button" class="btn btn-xs btn-secondary" data-auto-lock-action="all">All</button><button type="button" class="btn btn-xs btn-secondary" data-auto-lock-action="none">None</button><button type="button" class="btn btn-xs btn-primary" data-auto-lock-action="apply">Apply</button></div><div class="pp-bankMenuList"><label class="pp-bankOption"><input type="checkbox" id="ppDepoAutoApproveLockAll"> <span>Select all</span></label>${autoApproveLockOptions.map((item) => `<label class="pp-bankOption"><input type="checkbox" data-auto-lock-key="1" value="${escapeHtml(item.value)}" ${cfg.autoApproveLocks.includes(item.value) ? "checked" : ""}> <span>${escapeHtml(item.text)}</span></label>`).join("")}</div></div></div>` : `<label style="display:flex;align-items:center;gap:8px;margin:0;font-size:12px;font-weight:700"><input type="checkbox" id="ppWdQueueMode" ${cfg.queueMode ? "checked" : ""}> Mode Safe Withdraw</label><span><strong>Show Pending Forms</strong></span><select class="form-control form-select" id="ppWdLimit" style="width:100px;display:inline-block"><option value="999999">All</option><option value="100">100</option><option value="200">200</option><option value="300">300</option></select>`}
+                <span><strong>Sort By</strong></span>
+                <select class="form-control form-select" id="${isDeposit ? "ppDepoSort" : "ppWdSort"}" style="width:100px;display:inline-block">
+                  <option value="date">Tanggal</option>
+                  <option value="bank">Bank</option>
+                  <option value="jumlah">Jumlah</option>
+                </select>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="alert ${isDeposit ? "alert-success" : "alert-danger"} pp-filterBar" style="background-color:#F9F9F9;margin-top:0;border-color:${isDeposit ? "#d6e9c6" : "#eed3d7"};">
-          <div class="pp-row">
-            <div class="col-auto"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="${isDeposit ? "ppDepoShowAll" : "ppWdShowAll"}"> <strong>Show All Transactions</strong></label></div>
-            <div class="pp-bankSummary">${bankSummary}</div>
-            <div class="pp-rowPush pp-row">
-              <span><strong>Select Bank</strong></span>
-              <select class="form-control form-select" id="${isDeposit ? "ppDepoBankMode" : "ppWdBankMode"}" style="width:90px;display:inline-block">
-                <option value="">All</option>
-                <option value="active">Active</option>
-              </select>
-              <div class="pp-bankMenuWrap">
-                <button type="button" class="btn btn-secondary" id="${isDeposit ? "ppDepoBankToggle" : "ppWdBankToggle"}" style="min-width:140px">${bankLabel}</button>
-                <div class="pp-bankMenu" id="${isDeposit ? "ppDepoBankMenu" : "ppWdBankMenu"}">
-                  <div class="pp-bankMenuTools">
-                    <button type="button" class="btn btn-xs btn-secondary" data-bank-action="all">All</button>
-                    <button type="button" class="btn btn-xs btn-secondary" data-bank-action="none">None</button>
-                    <button type="button" class="btn btn-xs btn-primary" data-bank-action="apply">Apply</button>
-                  </div>
-                  <div class="pp-bankMenuList">
-                    ${banks.map((bank) => `
-                      <label class="pp-bankOption">
-                        <input type="checkbox" value="${escapeHtml(bank.value)}" ${cfg.banks.includes(bank.value) ? "checked" : ""}>
-                        <span>${escapeHtml(bank.text)}</span>
-                      </label>
-                    `).join("")}
+          <div class="alert ${isDeposit ? "alert-success" : "alert-danger"} pp-filterBar" style="background-color:#F9F9F9;margin-top:0;border-color:${isDeposit ? "#d6e9c6" : "#eed3d7"};">
+            <div class="pp-row">
+              <div class="col-auto"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="${isDeposit ? "ppDepoShowAll" : "ppWdShowAll"}"> <strong>Show All Transactions</strong></label></div>
+              <div class="pp-bankSummary">${bankSummary}</div>
+              <div class="pp-rowPush pp-row">
+                <span><strong>Select Bank</strong></span>
+                <select class="form-control form-select" id="${isDeposit ? "ppDepoBankMode" : "ppWdBankMode"}" style="width:90px;display:inline-block">
+                  <option value="">All</option>
+                  <option value="active">Active</option>
+                </select>
+                <div class="pp-bankMenuWrap">
+                  <button type="button" class="btn btn-secondary" id="${isDeposit ? "ppDepoBankToggle" : "ppWdBankToggle"}" style="min-width:140px">${bankLabel}</button>
+                  <div class="pp-bankMenu" id="${isDeposit ? "ppDepoBankMenu" : "ppWdBankMenu"}">
+                    <div class="pp-bankMenuTools">
+                      <button type="button" class="btn btn-xs btn-secondary" data-bank-action="all">All</button>
+                      <button type="button" class="btn btn-xs btn-secondary" data-bank-action="none">None</button>
+                      <button type="button" class="btn btn-xs btn-primary" data-bank-action="apply">Apply</button>
+                    </div>
+                    <div class="pp-bankMenuList">
+                      ${banks.map((bank) => `
+                        <label class="pp-bankOption">
+                          <input type="checkbox" value="${escapeHtml(bank.value)}" ${cfg.banks.includes(bank.value) ? "checked" : ""}>
+                          <span>${escapeHtml(bank.text)}</span>
+                        </label>
+                      `).join("")}
+                    </div>
                   </div>
                 </div>
+                <button type="button" class="btn btn-secondary pp-refreshBtn" id="${isDeposit ? "ppDepoRefresh" : "ppWdRefresh"}" style="width:90px">Refresh</button>
               </div>
-              <button type="button" class="btn btn-secondary pp-refreshBtn" id="${isDeposit ? "ppDepoRefresh" : "ppWdRefresh"}" style="width:90px">Refresh</button>
             </div>
           </div>
         </div>
+        <div class="pp-sectionBody" style="margin-top:18px;">
+          ${bodyHtml}
+        </div>
       </div>
-      <div class="pp-sectionBody" style="margin-top:18px;">
-        ${bodyHtml}
-      </div>
+      <div class="pp-approvedSection" id="ppSectionApproved-${type}">${approvedHistoryHtml}</div>
     `;
   }
 
@@ -2261,6 +3936,9 @@ function normalizeBankLabelKey(value) {
           }
         });
       }
+      bindDepositApprovedControls(tab);
+    } else {
+      bindWithdrawApprovedControls(tab);
     }
 
     bindBankMenu(type, tab);
@@ -2950,15 +4628,7 @@ function bindDepositAutoApproveLockMenu(tab) {
     const now = Date.now();
     if (now - (state.lastSafeWithdrawAlertAt || 0) < 1200) return false;
     state.lastSafeWithdrawAlertAt = now;
-    try {
-      if (typeof window.alert === "function") {
-        window.alert("Mode Safe Withdraw Aktif.");
-        return true;
-      }
-    } catch (error) {
-      console.error(error);
-    }
-    return false;
+    return showPanelToast("Mode Safe Withdraw Aktif.", "warn", 1700);
   }
 
   function bindSafeWithdrawLockGuard() {
@@ -3132,11 +4802,7 @@ function renderDepositAutoApproveUi(tab) {
       if (raw == null) return null;
       const parsed = parsePositiveAmount(raw, 0);
       if (parsed > 0) return parsed;
-      try {
-        if (typeof window.alert === "function") {
-          window.alert("Nominal auto approve harus berupa angka lebih dari 0.");
-        }
-      } catch (_) {}
+      showPanelToast("Nominal auto approve harus berupa angka lebih dari 0.", "warn", 1700);
       next = startValue;
     }
     return null;
@@ -3378,7 +5044,7 @@ function getDepositExactAmountInput(row, id) {
       return;
     }
 
-    if (!state.loading[type] && Date.now() - (state.lastLoadedAt[type] || 0) > 180) {
+    if (!state.loading[type] && Date.now() - (state.lastLoadedAt[type] || 0) > 1200) {
       loadSection(type, { busyText: "Syncing...", silent: true });
     }
     if (type === "depo") {
@@ -3490,6 +5156,7 @@ function getDepositExactAmountInput(row, id) {
     if (state.drag && state.drag.bound) return;
     if (state.drag) state.drag.bound = true;
     const start = (event) => {
+      if (!event || (typeof event.button === "number" && event.button !== 0)) return;
       if (event.target.closest("button, input, select, textarea, label, a")) return;
       const rect = refs.panel.getBoundingClientRect();
       state.drag.active = true;
@@ -3499,24 +5166,34 @@ function getDepositExactAmountInput(row, id) {
       state.drag.left = rect.left;
       state.drag.top = rect.top;
       refs.header.style.cursor = "grabbing";
-      refs.header.setPointerCapture(event.pointerId);
+      refs.panel.style.transition = "none";
+      try { refs.header.setPointerCapture(event.pointerId); } catch (_) {}
     };
 
     const move = (event) => {
       if (!state.drag.active || event.pointerId !== state.drag.pointerId) return;
-      const nextLeft = state.drag.left + (event.clientX - state.drag.startX);
-      const nextTop = state.drag.top + (event.clientY - state.drag.startY);
-      refs.panel.style.left = `${nextLeft}px`;
-      refs.panel.style.top = `${nextTop}px`;
+      const metrics = getPanelViewportMetrics();
+      const size = getPanelSizeFromViewport(metrics.vw, metrics.vh);
+      const maxLeft = Math.max(metrics.gapX, metrics.vw - size.width - metrics.gapX);
+      const maxTop = Math.max(metrics.gapY, metrics.vh - size.height - metrics.gapY);
+      const nextLeft = Math.min(maxLeft, Math.max(metrics.gapX, state.drag.left + (event.clientX - state.drag.startX)));
+      const nextTop = Math.min(maxTop, Math.max(metrics.gapY, state.drag.top + (event.clientY - state.drag.startY)));
+      state.panelPosition.mode = "manual";
+      state.panelPosition.left = Math.round(nextLeft);
+      state.panelPosition.top = Math.round(nextTop);
+      refs.panel.style.left = `${state.panelPosition.left}px`;
+      refs.panel.style.top = `${state.panelPosition.top}px`;
       refs.panel.style.right = "auto";
-      clampPanel();
+      refs.panel.style.transform = "none";
     };
 
     const end = (event) => {
       if (!state.drag.active || event.pointerId !== state.drag.pointerId) return;
       state.drag.active = false;
       refs.header.style.cursor = "grab";
+      refs.panel.style.transition = "";
       try { refs.header.releasePointerCapture(event.pointerId); } catch (error) {}
+      clampPanel();
     };
 
     refs.header.addEventListener("pointerdown", start);
@@ -3526,27 +5203,36 @@ function getDepositExactAmountInput(row, id) {
   }
 
   function clampPanel() {
-    const rect = refs.panel.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    let left = rect.left;
-    let top = rect.top;
+    const metrics = getPanelViewportMetrics();
+    const size = getPanelSizeFromViewport(metrics.vw, metrics.vh);
+    const centeredLeft = Math.max(metrics.gapX, Math.round((metrics.vw - size.width) / 2));
+    const maxLeft = Math.max(metrics.gapX, metrics.vw - size.width - metrics.gapX);
+    const maxTop = Math.max(metrics.gapY, metrics.vh - size.height - metrics.gapY);
+    const useManual = state.panelPosition && state.panelPosition.mode === "manual";
+    const left = useManual
+      ? Math.min(maxLeft, Math.max(metrics.gapX, Math.round(state.panelPosition.left || centeredLeft)))
+      : centeredLeft;
+    const top = useManual
+      ? Math.min(maxTop, Math.max(metrics.gapY, Math.round(state.panelPosition.top || metrics.gapY)))
+      : metrics.gapY;
 
-    if (Number.isNaN(left) || Number.isNaN(top)) return;
-    if (!refs.panel.style.left) {
-      left = Math.max(8, vw - rect.width - 18);
-      refs.panel.style.left = `${left}px`;
-      refs.panel.style.right = "auto";
-    }
-    if (!refs.panel.style.top) {
-      top = 52;
-      refs.panel.style.top = `${top}px`;
-    }
-
-    left = Math.min(Math.max(8, parseFloat(refs.panel.style.left) || left), Math.max(8, vw - rect.width - 8));
-    top = Math.min(Math.max(8, parseFloat(refs.panel.style.top) || top), Math.max(8, vh - Math.min(rect.height, vh - 16) - 8));
+    refs.panel.style.width = `${size.width}px`;
+    refs.panel.style.maxWidth = `${size.maxWidth}px`;
+    refs.panel.style.height = `${size.height}px`;
+    refs.panel.style.maxHeight = `${size.maxHeight}px`;
     refs.panel.style.left = `${left}px`;
     refs.panel.style.top = `${top}px`;
+    refs.panel.style.right = "auto";
+    refs.panel.style.transform = "none";
+    refs.panel.style.transformOrigin = "top center";
+    refs.panel.style.setProperty("--pp-panel-gap-x", `${metrics.gapX}px`);
+    refs.panel.style.setProperty("--pp-panel-gap-y", `${metrics.gapY}px`);
+    refs.panel.style.setProperty("--pp-panel-zoom", String(metrics.zoom));
+
+    if (useManual) {
+      state.panelPosition.left = left;
+      state.panelPosition.top = top;
+    }
   }
 
   function destroyPanel(reason) {
@@ -3577,6 +5263,20 @@ function getDepositExactAmountInput(row, id) {
         state.menuCloseFns[type] = null;
       }
     });
+    clearDepositApprovedRefreshTimer();
+    clearDepositApprovedSyncTimers();
+    const depoApprovedController = state.depo && state.depo.approved ? state.depo.approved.abortController : null;
+    if (depoApprovedController) {
+      try { depoApprovedController.abort(); } catch (error) {}
+      state.depo.approved.abortController = null;
+    }
+    clearWithdrawApprovedRefreshTimer();
+    clearWithdrawApprovedSyncTimers();
+    const approvedController = state.wd && state.wd.approved ? state.wd.approved.abortController : null;
+    if (approvedController) {
+      try { approvedController.abort(); } catch (error) {}
+      state.wd.approved.abortController = null;
+    }
     if (state.menuCloseFns.depoAutoApproveLock) {
       document.removeEventListener("mousedown", state.menuCloseFns.depoAutoApproveLock, true);
       state.menuCloseFns.depoAutoApproveLock = null;
@@ -3692,6 +5392,7 @@ function getDepositExactAmountInput(row, id) {
   };
 
   const memoryQueue = { deposit: [], withdraw: [], ewallet: [], pulsa: [] };
+  const fastLaneInFlight = new Map();
   let flushBusy = false;
   let flushTimer = 0;
   let flushTimerAt = 0;
@@ -3705,6 +5406,150 @@ function getDepositExactAmountInput(row, id) {
   let wrapWatchVisibilityHandler = null;
   let onlineHandler = null;
   let flushVisibilityHandler = null;
+  let networkSyncCleanup = null;
+  const NET_SYNC_KEY = "__ppGsNetSyncInstalled";
+  const NET_SYNC_PATCH_KEY = "__ppGsNetSyncPatch";
+
+  function installApprovalNetworkSync() {
+    if (window[NET_SYNC_KEY]) return;
+    const originalFetch = typeof window.fetch === "function" ? window.fetch : null;
+    const XHR = window.XMLHttpRequest;
+    const previousPatch = window[NET_SYNC_PATCH_KEY] || {};
+    const originalOpen = previousPatch.originalOpen || (XHR && XHR.prototype ? XHR.prototype.open : null);
+    const originalSend = previousPatch.originalSend || (XHR && XHR.prototype ? XHR.prototype.send : null);
+    const recent = new Map();
+
+    const shouldRun = (key, holdMs = 220) => {
+      const ts = recent.get(key) || 0;
+      const nowTs = now();
+      if (nowTs - ts < holdMs) return false;
+      recent.set(key, nowTs);
+      recent.forEach((value, mapKey) => {
+        if (nowTs - value > 6000) recent.delete(mapKey);
+      });
+      return true;
+    };
+
+    const looksJsonLike = (value) => /^[\[{]/.test(String(value || "").trim());
+
+    const inspect = (urlValue, methodValue, responseText) => {
+      const url = String(urlValue || "");
+      const method = String(methodValue || "GET").toUpperCase();
+      if (!url || method !== "POST") return;
+
+      if (/\/approveDeposit\b/i.test(url)) {
+        if (!shouldRun("approve-deposit")) return;
+        queueMicrotask(() => schedulePanelRefresh("depo", true));
+        queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [120, 420, 900, 1700, 3000, 5200, 7600] }));
+        return;
+      }
+
+      if (/\/approveWithdraw\b/i.test(url)) {
+        if (!shouldRun("approve-withdraw")) return;
+        queueMicrotask(() => schedulePanelRefresh("wd", true));
+        queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [120, 420, 900, 1700, 3000, 5200, 7600] }));
+        return;
+      }
+
+      if (/\/depositApproved(?:Content)?\b/i.test(url)) {
+        if (!shouldRun("deposit-approved-read")) return;
+        queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [160, 680, 1500] }));
+        return;
+      }
+
+      if (/\/withdrawApproved(?:Content)?\b/i.test(url)) {
+        if (!shouldRun("withdraw-approved-read")) return;
+        queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [160, 680, 1500] }));
+        return;
+      }
+
+      if (/\/(depositPending|withdrawPending)\b/i.test(url) && looksJsonLike(responseText)) {
+        return;
+      }
+    };
+
+    if (originalFetch && !originalFetch.__ppGsNetSyncWrapped) {
+      const wrappedFetch = function () {
+        const requestInit = arguments[1] || {};
+        const skipInspect = (() => {
+          try {
+            const headers = requestInit && requestInit.headers;
+            if (!headers) return false;
+            if (typeof Headers !== "undefined" && headers instanceof Headers) {
+              return String(headers.get("x-pp-no-observe") || "") === "1";
+            }
+            if (Array.isArray(headers)) {
+              return headers.some((pair) => Array.isArray(pair) && String(pair[0] || "").toLowerCase() === "x-pp-no-observe" && String(pair[1] || "") === "1");
+            }
+            if (typeof headers === "object") {
+              return Object.keys(headers).some((key) => String(key || "").toLowerCase() === "x-pp-no-observe" && String(headers[key] || "") === "1");
+            }
+          } catch (_) {}
+          return false;
+        })();
+        const result = originalFetch.apply(this, arguments);
+        if (skipInspect) return result;
+        try {
+          Promise.resolve(result).then((response) => {
+            try {
+              if (!response || !response.ok || !response.clone) return;
+              const responseUrl = String(response.url || (arguments[0] && arguments[0].url) || arguments[0] || "");
+              const method = String((arguments[1] && arguments[1].method) || (arguments[0] && arguments[0].method) || "GET");
+              response.clone().text().then((bodyText) => inspect(responseUrl, method, bodyText)).catch(() => inspect(responseUrl, method, ""));
+            } catch (_) {}
+          }).catch(() => {});
+        } catch (_) {}
+        return result;
+      };
+      wrappedFetch.__ppGsNetSyncWrapped = true;
+      wrappedFetch.__ppGsNetSyncOriginal = originalFetch;
+      window.fetch = wrappedFetch;
+    }
+
+    if (XHR && XHR.prototype && typeof originalOpen === "function" && typeof originalSend === "function" && !XHR.prototype.open.__ppGsNetSyncWrapped) {
+      XHR.prototype.open = function (method, url) {
+        try {
+          this.__ppGsMethod = method;
+          this.__ppGsUrl = url;
+        } catch (_) {}
+        return originalOpen.apply(this, arguments);
+      };
+      XHR.prototype.open.__ppGsNetSyncWrapped = true;
+
+      XHR.prototype.send = function () {
+        if (!this.__ppGsNetSyncBound) {
+          this.__ppGsNetSyncBound = true;
+          this.addEventListener("loadend", () => {
+            try {
+              if (this.status < 200 || this.status >= 300) return;
+              inspect(this.responseURL || this.__ppGsUrl || "", this.__ppGsMethod || "GET", typeof this.responseText === "string" ? this.responseText : "");
+            } catch (_) {}
+          });
+        }
+        return originalSend.apply(this, arguments);
+      };
+      XHR.prototype.send.__ppGsNetSyncWrapped = true;
+
+      window[NET_SYNC_PATCH_KEY] = { originalOpen, originalSend };
+    }
+
+    window[NET_SYNC_KEY] = true;
+    networkSyncCleanup = () => {
+      try {
+        if (originalFetch && window.fetch && window.fetch.__ppGsNetSyncWrapped && window.fetch.__ppGsNetSyncOriginal === originalFetch) {
+          window.fetch = originalFetch;
+        }
+      } catch (_) {}
+      try {
+        if (XHR && XHR.prototype) {
+          if (typeof originalOpen === "function" && XHR.prototype.open && XHR.prototype.open.__ppGsNetSyncWrapped) XHR.prototype.open = originalOpen;
+          if (typeof originalSend === "function" && XHR.prototype.send && XHR.prototype.send.__ppGsNetSyncWrapped) XHR.prototype.send = originalSend;
+        }
+      } catch (_) {}
+      window[NET_SYNC_KEY] = false;
+      networkSyncCleanup = null;
+    };
+  }
   const originalNative = window[ORIGINAL_NATIVE_KEY] || {
     approveDeposit: null,
     approveWithdraw: null,
@@ -3758,6 +5603,161 @@ function getDepositExactAmountInput(row, id) {
     return false;
   }
 
+  function showInlineToast(message, mode = "info", holdMs = 1800) {
+    try {
+      if (typeof window.__ppPanelToast === "function") {
+        return !!window.__ppPanelToast(message, mode, holdMs);
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  const gsNotifyState = { key: "", at: 0, kind: "" };
+
+  function isAbortLike(error) {
+    const msg = String(error && (error.message || error) || "").toLowerCase();
+    return !!(error && error.name === "AbortError") || msg.includes("aborted") || msg.includes("abort") || msg.includes("timeout");
+  }
+
+  function parseGsResponseBody(raw) {
+    const text = String(raw == null ? "" : raw).trim();
+    if (!text) return { raw: "", parsed: null, lower: "" };
+    let parsed = null;
+    if (/^[\[{]/.test(text)) {
+      try { parsed = JSON.parse(text); } catch (_) {}
+    }
+    return { raw: text, parsed, lower: text.toLowerCase() };
+  }
+
+  function pickGsResponseMessage(parsed, raw) {
+    if (parsed && typeof parsed === "object") {
+      const fields = [parsed.message, parsed.msg, parsed.status, parsed.result, parsed.error, parsed.reason];
+      for (const value of fields) {
+        const text = String(value == null ? "" : value).trim();
+        if (text) return text;
+      }
+    }
+    const text = String(raw == null ? "" : raw).trim();
+    if (!text) return "";
+    return text.replace(/\s+/g, " ").slice(0, 180);
+  }
+
+  function classifyGsResponse(res, rawBody) {
+    const status = Number(res && res.status) || 0;
+    const body = parseGsResponseBody(rawBody);
+    const parsed = body.parsed;
+    const lower = body.lower;
+    const message = pickGsResponseMessage(parsed, body.raw);
+
+    const explicitOk = !!(
+      (parsed && typeof parsed === "object" && (parsed.ok === true || parsed.success === true || String(parsed.status || "").toLowerCase() === "success" || String(parsed.result || "").toLowerCase() === "success")) ||
+      /(ok|success|berhasil|sukses|done|sent)/i.test(body.raw) ||
+      lower.includes('"ok":true') ||
+      lower.includes('"success":true')
+    );
+
+    const explicitFail = !!(
+      (parsed && typeof parsed === "object" && (parsed.ok === false || parsed.success === false || /^(fail|failed|error|invalid)$/i.test(String(parsed.status || parsed.result || parsed.error || "")))) ||
+      /(fail|failed|gagal|error|invalid|denied|forbidden)/i.test(body.raw) ||
+      lower.includes('"ok":false') ||
+      lower.includes('"success":false')
+    );
+
+    if (!(res && res.ok)) {
+      if (status >= 400 && status < 500 && status !== 429) {
+        return { kind: "fail", status, message: message || `HTTP ${status}` };
+      }
+      return { kind: "retry", status, message: message || `HTTP ${status || 0}` };
+    }
+
+    if (explicitFail) return { kind: "fail", status, message: message || `HTTP ${status || 200}` };
+    if (explicitOk) return { kind: "success", status, message: message || `HTTP ${status || 200}` };
+    if (!body.raw || status === 204) return { kind: "success", status: status || 204, message: message || `HTTP ${status || 204}` };
+    return { kind: "success", status: status || 200, message: message || `HTTP ${status || 200}` };
+  }
+
+  function createGsFlushSummary() {
+    return {
+      successRows: 0,
+      failRows: 0,
+      errorRows: 0,
+      successRoutes: new Set(),
+      failRoutes: new Set(),
+      errorRoutes: new Set(),
+      details: []
+    };
+  }
+
+  function recordGsFlushSummary(summary, kind, route, rowsCount, detail) {
+    if (!summary) return;
+    const safeKind = kind === "success" || kind === "fail" ? kind : "error";
+    const count = Math.max(0, Number(rowsCount) || 0);
+    if (safeKind === "success") {
+      summary.successRows += count;
+      if (route) summary.successRoutes.add(route);
+    } else if (safeKind === "fail") {
+      summary.failRows += count;
+      if (route) summary.failRoutes.add(route);
+    } else {
+      summary.errorRows += count;
+      if (route) summary.errorRoutes.add(route);
+    }
+    const text = String(detail || "").trim();
+    if (text && summary.details.length < 6) summary.details.push(text);
+  }
+
+  function formatGsRouteLabel(route) {
+    const value = String(route || "").toLowerCase();
+    if (value === "deposit") return "deposit";
+    if (value === "withdraw") return "withdraw";
+    if (value === "ewallet") return "e-wallet";
+    if (value === "pulsa") return "pulsa";
+    if (value === "dana") return "dana";
+    return value || "google sheet";
+  }
+
+  function formatGsRouteSummary(routeSet) {
+    const list = Array.from(routeSet || []).map((route) => formatGsRouteLabel(route)).filter(Boolean);
+    if (!list.length) return "google sheet";
+    if (list.length === 1) return list[0];
+    if (list.length === 2) return `${list[0]} & ${list[1]}`;
+    return `${list[0]}, ${list[1]} +${list.length - 2}`;
+  }
+
+  function emitGsStatusToast(message, kind = "info", holdMs = 2600, dedupeKey = "") {
+    const text = String(message || "").trim();
+    if (!text) return false;
+    const key = String(dedupeKey || `${kind}|${text}`);
+    const nowTs = now();
+    const minGap = kind === "success" ? 1200 : 700;
+    if (gsNotifyState.key === key && nowTs - gsNotifyState.at < minGap) return false;
+    gsNotifyState.key = key;
+    gsNotifyState.kind = kind;
+    gsNotifyState.at = nowTs;
+    const mode = kind === "success" ? "success" : (kind === "fail" ? "warn" : (kind === "error" ? "warn" : "info"));
+    return showInlineToast(text, mode, holdMs);
+  }
+
+  function flushGsStatusToast(summary) {
+    if (!summary) return;
+    if (summary.errorRows > 0) {
+      const routeText = formatGsRouteSummary(summary.errorRoutes);
+      const detail = summary.details[0] ? ` (${summary.details[0]})` : "";
+      emitGsStatusToast(`Google Sheet error: ${summary.errorRows} row ${routeText} belum terkirim${detail}.`, "error", 3400, `err|${summary.errorRows}|${routeText}|${summary.details[0] || ""}`);
+      return;
+    }
+    if (summary.failRows > 0) {
+      const routeText = formatGsRouteSummary(summary.failRoutes);
+      const detail = summary.details[0] ? ` (${summary.details[0]})` : "";
+      emitGsStatusToast(`Data Gagal: ${summary.failRows} row ${routeText} ditolak endpoint${detail}.`, "fail", 3200, `fail|${summary.failRows}|${routeText}|${summary.details[0] || ""}`);
+      return;
+    }
+    if (summary.successRows > 0) {
+      const routeText = formatGsRouteSummary(summary.successRoutes);
+      emitGsStatusToast(`Data Berhasil : ${summary.successRows} row ${routeText} terkirim.`, "success", 2200, `ok|${summary.successRows}|${routeText}`);
+    }
+  }
+
   function loadCfg() {
     try {
       const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
@@ -3782,7 +5782,7 @@ function getDepositExactAmountInput(row, id) {
       stats: { ...DEFAULT_CFG.stats, ...(next.stats || {}) }
     };
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch (_) {}
-    renderUserTabIfVisible();
+    queueUserTabRender(0);
     return cfg;
   }
 
@@ -3944,6 +5944,56 @@ function getDepositExactAmountInput(row, id) {
     return out;
   }
 
+  function getRowFastLaneSig(type, row) {
+    return rowSeenSig(type, row) || rowQueueSig(type, row);
+  }
+
+  function pruneFastLaneInFlight() {
+    const nowTs = now();
+    fastLaneInFlight.forEach((value, key) => {
+      if (!value || nowTs >= value.expireAt) fastLaneInFlight.delete(key);
+    });
+  }
+
+  function markFastLaneInFlight(type, rows, holdMs = 12000) {
+    const until = now() + Math.max(1500, Number(holdMs) || 0);
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const sig = getRowFastLaneSig(type, row);
+      if (!sig) return;
+      fastLaneInFlight.set(sig, { expireAt: until });
+    });
+  }
+
+  function clearFastLaneInFlight(type, rows) {
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const sig = getRowFastLaneSig(type, row);
+      if (!sig) return;
+      fastLaneInFlight.delete(sig);
+    });
+  }
+
+  function appendRowsToQueue(rows, type, scheduleDelay = 60) {
+    if (!Array.isArray(rows) || !rows.length) return 0;
+    const target = memoryQueue[type];
+    if (!target) return 0;
+    const stored = loadPersistedQueue();
+    const existing = new Set();
+    target.forEach((row) => existing.add(rowQueueSig(type, row)));
+    (stored[type] || []).forEach((row) => existing.add(rowQueueSig(type, row)));
+    let added = 0;
+    dedupeRowsBySig(rows, type, "queue").forEach((row) => {
+      const sig = rowQueueSig(type, row);
+      if (sig && existing.has(sig)) return;
+      if (sig) existing.add(sig);
+      target.push(row);
+      added += 1;
+    });
+    persistMemoryQueue();
+    queueUserTabRender(80);
+    if (added > 0 && scheduleDelay !== false) scheduleFlush(scheduleDelay === true ? 0 : scheduleDelay);
+    return added;
+  }
+
   function encodedSize(rows) {
     try {
       return new TextEncoder().encode("data=" + encodeURIComponent(JSON.stringify(rows || []))).length;
@@ -3981,27 +6031,114 @@ function getDepositExactAmountInput(row, id) {
   }
 
   function enqueueRows(rows, type) {
-    if (!Array.isArray(rows) || !rows.length) return;
-    const target = memoryQueue[type];
-    if (!target) return;
-    const stored = loadPersistedQueue();
-    const existing = new Set();
-    target.forEach((row) => existing.add(rowQueueSig(type, row)));
-    (stored[type] || []).forEach((row) => existing.add(rowQueueSig(type, row)));
-    dedupeRowsBySig(rows, type, "queue").forEach((row) => {
-      const sig = rowQueueSig(type, row);
-      if (sig && existing.has(sig)) return;
-      if (sig) existing.add(sig);
-      target.push(row);
-    });
-    persistMemoryQueue();
-    renderUserTabIfVisible();
-    scheduleFlush();
+    appendRowsToQueue(rows, type, 60);
   }
 
-  function sendToGSheetBatch(rows, type) {
-    if (!isGsOn()) return;
+  async function sendToGSheetFastLane(rows, type, options = {}) {
+    if (!isGsOn()) return { sent: 0, queued: 0, skipped: Array.isArray(rows) ? rows.length : 0 };
+    const inputRows = Array.isArray(rows) ? rows : [];
+    if (!inputRows.length) return { sent: 0, queued: 0, skipped: 0 };
+
+    pruneFastLaneInFlight();
+
+    const seenSet = new Set(loadSeen());
+    const deduped = dedupeRowsBySig(inputRows, type, "queue");
+    const filtered = [];
+    deduped.forEach((row) => {
+      const seenSig = rowSeenSig(type, row);
+      if (seenSig && seenSet.has(seenSig)) return;
+      const sig = getRowFastLaneSig(type, row);
+      if (sig && fastLaneInFlight.has(sig)) return;
+      filtered.push(row);
+    });
+
+    if (!filtered.length) {
+      return { sent: 0, queued: 0, skipped: inputRows.length };
+    }
+
+    markFastLaneInFlight(type, filtered, options.holdMs || 12000);
+
+    const urls = getGsUrls();
+    const cfg = getCfgNetwork();
+    const retryCount = Math.max(1, Math.min(2, Number(options.retry) || Math.max(1, cfg.RETRY - 1)));
+    const baseDelay = Math.max(120, Math.min(200, Number(options.baseDelay) || cfg.BASE_DELAY || 160));
+    const summary = createGsFlushSummary();
+    const seenToAppend = [];
+    const fallbackRows = [];
+    const bucketMap = new Map();
+
+    try {
+      filtered.forEach((row) => {
+        const endpointInfo = resolveEndpointForQueuedRow(type, row, urls);
+        if (!endpointInfo.url) {
+          fallbackRows.push(row);
+          return;
+        }
+        const bucketKey = `${endpointInfo.route}|${endpointInfo.url}`;
+        if (!bucketMap.has(bucketKey)) bucketMap.set(bucketKey, { url: endpointInfo.url, route: endpointInfo.route, rows: [] });
+        bucketMap.get(bucketKey).rows.push(row);
+      });
+
+      const tasks = [];
+      bucketMap.forEach((bucket) => {
+        const chunks = chunkRows(bucket.rows, Math.min(cfg.MAX_ROWS, 24), Math.min(cfg.MAX_BYTES, 90000));
+        chunks.forEach((chunk) => {
+          tasks.push(async () => {
+            try {
+              const ok = await fetchRetry(bucket.url, chunk, type, retryCount, baseDelay, { route: bucket.route, summary });
+              if (ok === true) {
+                chunk.map((row) => rowSeenSig(type, row)).filter(Boolean).forEach((sig) => {
+                  if (!seenSet.has(sig)) {
+                    seenSet.add(sig);
+                    seenToAppend.push(sig);
+                  }
+                });
+                return;
+              }
+            } catch (_) {
+              fallbackRows.push(...chunk);
+            }
+          });
+        });
+      });
+
+      if (tasks.length) {
+        await runPool(tasks, Math.max(1, Math.min(cfg.CONC, 2)));
+      }
+
+      if (seenToAppend.length) {
+        saveSeen(Array.from(seenSet).slice(-600));
+      }
+
+      if (fallbackRows.length) {
+        appendRowsToQueue(fallbackRows, type, false);
+      }
+
+      flushGsStatusToast(summary);
+      persistMemoryQueue();
+      queueUserTabRender(60);
+
+      if (fallbackRows.length) {
+        scheduleFlush(0);
+      }
+
+      return {
+        sent: summary.successRows,
+        queued: fallbackRows.length,
+        skipped: Math.max(0, inputRows.length - filtered.length)
+      };
+    } finally {
+      clearFastLaneInFlight(type, filtered);
+    }
+  }
+
+  function sendToGSheetBatch(rows, type, options = {}) {
+    if (!isGsOn()) return Promise.resolve({ sent: 0, queued: 0, skipped: Array.isArray(rows) ? rows.length : 0 });
+    if (options && options.fastLane) {
+      return sendToGSheetFastLane(rows, type, options);
+    }
     enqueueRows(rows, type);
+    return Promise.resolve({ sent: 0, queued: Array.isArray(rows) ? rows.length : 0, skipped: 0 });
   }
 
   function getCfgNetwork() {
@@ -4150,25 +6287,37 @@ function getDepositExactAmountInput(row, id) {
     return { url: urls.A || "", route: "deposit", bankKey };
   }
 
-  async function fetchRetry(url, rows, type, maxRetry, baseDelay) {
+  async function fetchRetry(url, rows, type, maxRetry, baseDelay, meta = {}) {
+    const route = String(meta && meta.route || type || "").trim().toLowerCase();
+    const summary = meta && meta.summary;
     let attempt = 0;
     while (true) {
       try {
         const res = await timeoutFetch(url, rows, 9000);
-        if (!res.ok) {
-          if (res.status >= 400 && res.status < 500 && res.status !== 429) {
-            pushDead(type, rows);
-            updateStats({ errAt: now() });
-            return null;
-          }
-          throw new Error("HTTP " + res.status);
+        const rawBody = await res.text().catch(() => "");
+        const outcome = classifyGsResponse(res, rawBody);
+
+        if (outcome.kind === "success") {
+          updateStats({ okAt: now() });
+          recordGsFlushSummary(summary, "success", route, Array.isArray(rows) ? rows.length : 0, outcome.message);
+          return true;
         }
-        updateStats({ okAt: now() });
-        return true;
+
+        if (outcome.kind === "fail") {
+          pushDead(type, rows);
+          updateStats({ errAt: now() });
+          recordGsFlushSummary(summary, "fail", route, Array.isArray(rows) ? rows.length : 0, outcome.message);
+          return null;
+        }
+
+        throw new Error(outcome.message || (outcome.status ? `HTTP ${outcome.status}` : "Retry request"));
       } catch (error) {
         updateStats({ errAt: now() });
         attempt += 1;
-        if (attempt > maxRetry) throw error;
+        if (attempt > maxRetry) {
+          recordGsFlushSummary(summary, "error", route, Array.isArray(rows) ? rows.length : 0, isAbortLike(error) ? "timeout" : (error && error.message ? error.message : String(error)));
+          throw error;
+        }
         const wait = baseDelay * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 120);
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
@@ -4254,6 +6403,7 @@ function getDepositExactAmountInput(row, id) {
     const cfg = getCfgNetwork();
     const seenSet = new Set(loadSeen());
     const seenToAppend = [];
+    const flushSummary = createGsFlushSummary();
 
     try {
       const tasks = [];
@@ -4284,7 +6434,7 @@ function getDepositExactAmountInput(row, id) {
           chunks.forEach((chunk) => {
             tasks.push(async () => {
               try {
-                const ok = await fetchRetry(bucket.url, chunk, item.type, cfg.RETRY, cfg.BASE_DELAY);
+                const ok = await fetchRetry(bucket.url, chunk, item.type, cfg.RETRY, cfg.BASE_DELAY, { route: bucket.route, summary: flushSummary });
                 if (ok === true) {
                   chunk.map((row) => rowSeenSig(item.type, row)).filter(Boolean).forEach((sig) => {
                     if (!seenSet.has(sig)) {
@@ -4310,10 +6460,11 @@ function getDepositExactAmountInput(row, id) {
       if (seenToAppend.length) {
         saveSeen(Array.from(seenSet).slice(-600));
       }
+      flushGsStatusToast(flushSummary);
     } finally {
       flushBusy = false;
       persistMemoryQueue();
-      renderUserTabIfVisible();
+      queueUserTabRender(80);
       const remain = getPendingCount();
       if (remain > 0) {
         scheduleFlush(document.visibilityState === "hidden" ? 420 : (remain >= 30 ? 35 : 140));
@@ -4592,17 +6743,79 @@ function getDepositExactAmountInput(row, id) {
     return /^(BCA|MANDIRI|BNI|BRI|BSI|CIMB|SEABANK|DANAMON|ANTARBANK|JENIUS|DANA|OVO|GOPAY|LINKAJA|TELKOMSEL|AXIATA|XL)\b/.test(s);
   }
 
-  function getExactAccountName(row, username) {
+  function getExactAccountName(row, username, kind) {
     if (!row) return "";
-    const inputs = [...row.querySelectorAll("td input.form-control[readonly], td input[readonly]")]
-      .map((el) => textFromNode(el))
-      .filter(Boolean)
-      .filter((v) => !/^\d{6,30}$/.test(v.replace(/\s+/g, "")))
-      .filter((v) => !isLikelyAmountText(v))
-      .filter((v) => !isLikelyBankTargetText(v))
-      .filter((v) => !username || v.toLowerCase() !== String(username).toLowerCase());
-    if (inputs.length) return inputs[0].toUpperCase();
-    return "";
+
+    const blockPattern = /\b(?:bank(?:\s+(?:tujuan|asal))?|rekening\s+(?:tujuan|asal)|asal\s+transfer|tujuan\s+transfer|sumber\s+dana|metode(?:\s+transfer)?|payment|channel)\b/i;
+    const goodLabelPattern = /\b(?:nama(?:\s+rekening)?|atas\s+nama|account\s*name|account\s*holder|holder\s*name)\b/i;
+
+    const normalizeNameCandidate = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const isBadNameCandidate = (value) => {
+      const txt = normalizeNameCandidate(value);
+      if (!txt) return true;
+      if (username && txt.toLowerCase() === String(username).toLowerCase()) return true;
+      if (!/[A-Za-z]/.test(txt)) return true;
+      if (/\d{3,}/.test(txt)) return true;
+      if (txt.length < 3 || txt.length > 60) return true;
+      if (isLikelyAmountText(txt)) return true;
+      if (isLikelyBankTargetText(txt)) return true;
+      if (blockPattern.test(txt)) return true;
+      if (/approve|delete|reject|show all|sort by|select bank|loading|refresh|pending|deposit|withdraw|bonus|click to copy|manual|otomatis/i.test(txt)) return true;
+      return false;
+    };
+
+    const rankNameCandidate = (value, context) => {
+      const txt = normalizeNameCandidate(value);
+      const ctx = normalizeNameCandidate(context);
+      if (isBadNameCandidate(txt)) return -Infinity;
+      if (blockPattern.test(ctx) && !goodLabelPattern.test(ctx)) return -Infinity;
+      let score = 0;
+      if (goodLabelPattern.test(ctx)) score += 12;
+      if (/\b(?:nama|name)\b/i.test(ctx)) score += 6;
+      if (txt === txt.toUpperCase()) score += 2;
+      if (/^[A-Za-z .'-]+$/.test(txt)) score += 2;
+      const wordCount = txt.split(/\s+/).filter(Boolean).length;
+      if (wordCount >= 2 && wordCount <= 5) score += 3;
+      if (kind === "withdraw" && /withdraw/i.test(ctx)) score += 2;
+      if (kind === "deposit" && /deposit/i.test(ctx)) score += 2;
+      score += Math.min(txt.length, 24) / 10;
+      return score;
+    };
+
+    const inputNodes = [...row.querySelectorAll("td input.form-control[readonly], td input[readonly], td textarea[readonly], input.form-control[readonly], input[readonly], textarea[readonly]")];
+    const ranked = [];
+
+    inputNodes.forEach((el) => {
+      const value = normalizeNameCandidate(textFromNode(el));
+      if (!value) return;
+
+      const contexts = [
+        textFromNode(el.closest("td")),
+        textFromNode(el.closest(".row")),
+        textFromNode(el.parentElement),
+        textFromNode(el.previousElementSibling),
+        textFromNode(el.parentElement && el.parentElement.previousElementSibling),
+        textFromNode(el.parentElement && el.parentElement.parentElement)
+      ].filter(Boolean);
+
+      const context = contexts.join(" | ");
+      const score = rankNameCandidate(value, context);
+      if (!Number.isFinite(score)) return;
+      ranked.push({ value: value.toUpperCase(), score });
+    });
+
+    if (ranked.length) {
+      ranked.sort((a, b) => b.score - a.score || a.value.length - b.value.length);
+      return ranked[0].value;
+    }
+
+    const fallbacks = collectRowStrings(row)
+      .map((txt) => normalizeNameCandidate(txt))
+      .filter((txt) => !isBadNameCandidate(txt))
+      .filter((txt) => /^[A-Za-z][A-Za-z .'-]{2,59}$/.test(txt))
+      .sort((a, b) => b.length - a.length);
+
+    return fallbacks[0] ? fallbacks[0].toUpperCase() : "";
   }
 
   function guessUsername(row, id, kind) {
@@ -4621,22 +6834,35 @@ function getDepositExactAmountInput(row, id) {
     return candidates[0] || "";
   }
 
-  function guessName(row, username) {
-    const exact = getExactAccountName(row, username);
+  function guessName(row, username, kind) {
+    const exact = getExactAccountName(row, username, kind);
     if (exact) return exact;
+
     const texts = collectRowStrings(row);
+    const blockedPattern = /\b(?:bank(?:\s+(?:tujuan|asal))?|rekening\s+(?:tujuan|asal)|asal\s+transfer|tujuan\s+transfer|sumber\s+dana|metode(?:\s+transfer)?|payment|channel)\b/i;
+
     for (const text of texts) {
-      const m = text.match(/(?:nama(?: rekening)?|account name)\s*[:\-]?\s*([A-Za-z][A-Za-z '.-]{3,})/i);
-      if (m) return m[1].trim().toUpperCase();
+      const clean = String(text || "").replace(/\s+/g, " ").trim();
+      if (!clean || blockedPattern.test(clean)) continue;
+      const m = clean.match(/(?:nama(?:\s+rekening)?|atas\s+nama|account\s*name|account\s*holder|holder\s*name)\s*[:\-]?\s*([A-Za-z][A-Za-z '.-]{2,59})/i);
+      if (m) {
+        const value = String(m[1] || "").replace(/\s+/g, " ").trim();
+        if (value && !isLikelyBankTargetText(value) && !isLikelyAmountText(value)) return value.toUpperCase();
+      }
     }
+
     const preferred = texts
+      .map((txt) => String(txt || "").replace(/\s+/g, " ").trim())
       .filter((txt) => /[A-Za-z]/.test(txt))
       .filter((txt) => txt.length >= 4 && txt.length <= 60)
-      .filter((txt) => !txt.includes(username))
-      .filter((txt) => !/approve|delete|reject|show all|sort by|select bank|loading|refresh|pending|deposit|withdraw|bonus|click to copy/i.test(txt))
+      .filter((txt) => !username || txt.toLowerCase() !== String(username).toLowerCase())
+      .filter((txt) => !/approve|delete|reject|show all|sort by|select bank|loading|refresh|pending|deposit|withdraw|bonus|click to copy|manual|otomatis/i.test(txt))
+      .filter((txt) => !blockedPattern.test(txt))
       .filter((txt) => !isLikelyAmountText(txt))
       .filter((txt) => !isLikelyBankTargetText(txt))
+      .filter((txt) => /^[A-Za-z][A-Za-z .'-]{2,59}$/.test(txt))
       .sort((a, b) => b.length - a.length);
+
     return (preferred[0] || "").toUpperCase();
   }
 
@@ -4647,7 +6873,7 @@ function getDepositExactAmountInput(row, id) {
     const targetKey = getDepositTargetKey(row, id) || sourceKey;
     const route = routeTypeForBank(targetKey);
     const username = guessUsername(row, id, "deposit");
-    const nama = guessName(row, username);
+    const nama = guessName(row, username, "deposit");
     const nominal = getNominalFromRow(row, id);
     const nomorSn = getNumberOrSnFromRow(row);
     const targetCol = pickTargetCol(targetKey || (route === "pulsa" ? "TELKOMSEL" : ""));
@@ -4674,7 +6900,7 @@ function getDepositExactAmountInput(row, id) {
     const row = document.getElementById("withdrawPending-" + id);
     if (!row) return null;
     const username = guessUsername(row, id, "withdraw");
-    const nama = guessName(row, username);
+    const nama = guessName(row, username, "withdraw");
     const nominal = getNominalFromRow(row, id);
     const sourceKey = getWithdrawSourceKey(row, id);
     const targetCol = pickWithdrawTargetCol(sourceKey);
@@ -4833,22 +7059,37 @@ function getDepositExactAmountInput(row, id) {
       }
       const meta = invokeWithConfirmTracking(nativeDepo, this, arguments);
       try {
-        if (shouldProcessNativeAction(meta) && ctx && payload && payload.rows && payload.rows.length) {
+        const handled = shouldProcessNativeAction(meta);
+
+        if (handled) {
+          queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [220, 850, 1800, 3200, 5200, 7800] }));
+        }
+
+        if (handled && ctx && payload && payload.rows && payload.rows.length) {
+          if (isAutoCopyOn()) {
+            queueMicrotask(() => autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] deposit failed", error)));
+          }
+
           queueMicrotask(async () => {
             try {
-              const removed = await waitForPendingRowRemoval("deposit", id, ctx && ctx.source === "auto-deposit" ? 6500 : 5000, 170);
-              if (!removed) return;
               if (recentlyHandled("panel-approve:deposit:" + id, 8000)) return;
-              if (isGsOn()) sendToGSheetBatch(payload.rows, payload.type);
-              if (isAutoCopyOn()) {
-                await autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] deposit failed", error));
+              const fastLaneTask = isGsOn()
+                ? sendToGSheetBatch(payload.rows, payload.type, { fastLane: true, holdMs: ctx && ctx.source === "auto-deposit" ? 14000 : 12000, retry: 2, baseDelay: 140 })
+                : Promise.resolve(null);
+              const removed = await waitForPendingRowRemoval("deposit", id, ctx && ctx.source === "auto-deposit" ? 2600 : 1600, 120);
+              if (!removed) {
+                window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [900, 2200, 4200, 6800, 9600] });
+              } else {
+                window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [180, 700, 1500, 2800, 4800, 7200] });
               }
+              await Promise.resolve(fastLaneTask);
             } catch (error) {
               console.error("[PP-GS] deposit queue failed", error);
             }
           });
         }
-        if (shouldProcessNativeAction(meta) && !(ctx && ctx.source === "auto-deposit")) {
+
+        if (handled && !(ctx && ctx.source === "auto-deposit")) {
           queueMicrotask(() => schedulePanelRefresh("depo", true));
         }
       } catch (error) {
@@ -4871,22 +7112,37 @@ function getDepositExactAmountInput(row, id) {
       }
       const meta = invokeWithConfirmTracking(nativeWd, this, arguments);
       try {
-        if (shouldProcessNativeAction(meta) && ctx && payload && payload.rows && payload.rows.length) {
+        const handled = shouldProcessNativeAction(meta);
+
+        if (handled) {
+          queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [220, 850, 1800, 3200, 5200, 7800] }));
+        }
+
+        if (handled && ctx && payload && payload.rows && payload.rows.length) {
+          if (isAutoCopyOn()) {
+            queueMicrotask(() => autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] withdraw failed", error)));
+          }
+
           queueMicrotask(async () => {
             try {
-              const removed = await waitForPendingRowRemoval("withdraw", id, 5000, 170);
-              if (!removed) return;
               if (recentlyHandled("panel-approve:withdraw:" + id, 8000)) return;
-              if (isGsOn()) sendToGSheetBatch(payload.rows, payload.type);
-              if (isAutoCopyOn()) {
-                await autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] withdraw failed", error));
+              const fastLaneTask = isGsOn()
+                ? sendToGSheetBatch(payload.rows, payload.type, { fastLane: true, holdMs: 12000, retry: 2, baseDelay: 140 })
+                : Promise.resolve(null);
+              const removed = await waitForPendingRowRemoval("withdraw", id, 1600, 120);
+              if (!removed) {
+                window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [900, 2200, 4200, 6800, 9600] });
+              } else {
+                window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [180, 700, 1500, 2800, 4800, 7200] });
               }
+              await Promise.resolve(fastLaneTask);
             } catch (error) {
               console.error("[PP-GS] withdraw queue failed", error);
             }
           });
         }
-        if (shouldProcessNativeAction(meta)) {
+
+        if (handled) {
           queueMicrotask(() => schedulePanelRefresh("wd", true));
         }
       } catch (error) {
@@ -5230,17 +7486,27 @@ Target Col: ${result.targetCol}
 Response: ${snippet}`;
         console.warn("[Pending Panel][Test Send Failed]", { status: res.status, targetCol: result.targetCol, response: bodyText, endpoint: result.endpoint, type });
         setTestStatus(tab, "Test Gagal", "err", detail);
+        emitGsStatusToast(`Google Sheet gagal: test ${type} ditolak endpoint.`, "fail", 3200, `test-fail|${type}|${res.status}`);
         return;
       }
+      const outcome = classifyGsResponse(res, bodyText);
       const detail = `HTTP ${res.status}
 Target Col: ${result.targetCol}
 Response: ${snippet}`;
+      if (outcome.kind === "fail") {
+        console.warn("[Pending Panel][Test Send Failed]", { status: res.status, targetCol: result.targetCol, response: bodyText, endpoint: result.endpoint, type });
+        setTestStatus(tab, "Test Gagal", "err", detail);
+        emitGsStatusToast(`Google Sheet gagal: test ${type} dibalas gagal oleh endpoint.`, "fail", 3200, `test-fail-body|${type}|${outcome.message || ""}`);
+        return;
+      }
       console.info("[Pending Panel][Test Send OK]", { status: res.status, targetCol: result.targetCol, response: bodyText, endpoint: result.endpoint, type });
       setTestStatus(tab, "Test Berhasil", "ok", detail);
+      emitGsStatusToast(`Google Sheet berhasil: test ${type} terkirim.`, "success", 2200, `test-ok|${type}|${result.targetCol}`);
     } catch (error) {
       const detail = error && error.message ? error.message : String(error);
       console.error("[Pending Panel][Test Send Error]", error);
       setTestStatus(tab, "Test Error", "err", detail);
+      emitGsStatusToast(`Google Sheet error: test ${type} ${isAbortLike(error) ? "timeout / dibatalkan" : "bermasalah"}.`, "error", 3400, `test-err|${type}|${detail}`);
     } finally {
       if (sendBtn) {
         sendBtn.disabled = false;
@@ -5423,6 +7689,61 @@ Response: ${snippet}`;
     `;
   }
 
+  let userTabRenderTimer = 0;
+
+  function captureUserTabUiState(tab) {
+    if (!tab) return null;
+    const active = document.activeElement;
+    const activeId = active && tab.contains(active) ? (active.id || active.getAttribute("data-col-key") || "") : "";
+    const snapshot = {
+      scrollTop: tab.scrollTop || 0,
+      activeId,
+      values: {},
+      selectionStart: active && typeof active.selectionStart === "number" ? active.selectionStart : null,
+      selectionEnd: active && typeof active.selectionEnd === "number" ? active.selectionEnd : null
+    };
+    tab.querySelectorAll("input, textarea, select").forEach((field) => {
+      const key = field.id || field.getAttribute("data-col-key");
+      if (!key) return;
+      snapshot.values[key] = field.type === "checkbox" ? !!field.checked : String(field.value || "");
+    });
+    return snapshot;
+  }
+
+  function restoreUserTabUiState(tab, snapshot) {
+    if (!tab || !snapshot) return;
+    tab.querySelectorAll("input, textarea, select").forEach((field) => {
+      const key = field.id || field.getAttribute("data-col-key");
+      if (!key || !(key in snapshot.values)) return;
+      if (field.type === "checkbox") field.checked = !!snapshot.values[key];
+      else if (document.activeElement !== field) field.value = String(snapshot.values[key] || "");
+    });
+    tab.scrollTop = snapshot.scrollTop || 0;
+    if (snapshot.activeId) {
+      const escapedId = window.CSS && typeof window.CSS.escape === "function" ? CSS.escape(snapshot.activeId) : snapshot.activeId.replace(/[^a-zA-Z0-9_-]/g, "\$&");
+      const target = tab.querySelector(`#${escapedId}`) || tab.querySelector(`[data-col-key="${snapshot.activeId.replace(/"/g, '\"')}"]`);
+      if (target && typeof target.focus === "function") {
+        try {
+          target.focus({ preventScroll: true });
+          if (typeof snapshot.selectionStart === "number" && typeof target.setSelectionRange === "function") {
+            target.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd == null ? snapshot.selectionStart : snapshot.selectionEnd);
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  function queueUserTabRender(delay = 60) {
+    if (userTabRenderTimer) {
+      clearTimeout(userTabRenderTimer);
+      userTabRenderTimer = 0;
+    }
+    userTabRenderTimer = window.setTimeout(() => {
+      userTabRenderTimer = 0;
+      renderUserTabIfVisible();
+    }, Math.max(0, delay || 0));
+  }
+
   function bindUserTab(tab) {
     const toggle = tab.querySelector("#ppGsToggle");
     const autoCopyToggle = tab.querySelector("#ppAutoCopyToggle");
@@ -5449,11 +7770,7 @@ Response: ${snippet}`;
         const saved = setGsOn(toggle.checked);
         refreshUserConfigState(tab);
         if (saved && saved.enabled) {
-          try {
-            if (typeof window.alert === "function") {
-              window.alert("Google Sheet berhasil diaktifkan.");
-            }
-          } catch (_) {}
+          showInlineToast("Google Sheet berhasil diaktifkan.", "success", 1700);
           await showNativeBrowserNotice("Google Sheet ON", "Sinkronisasi approve ke endpoint aktif sudah diaktifkan.");
         }
       });
@@ -5479,9 +7796,7 @@ Response: ${snippet}`;
           tab.querySelector("#ppGsE")?.value || ""
         );
         refreshUserConfigState(tab);
-        try {
-          if (typeof window.alert === "function") window.alert("Endpoint Google Sheet berhasil disimpan.");
-        } catch (_) {}
+        showInlineToast("Endpoint Google Sheet berhasil disimpan.", "success", 1700);
       });
     }
 
@@ -5498,9 +7813,7 @@ Response: ${snippet}`;
       colSaveBtn.addEventListener("click", () => {
         setColMap(readColMapFromInputs());
         refreshUserConfigState(tab);
-        try {
-          if (typeof window.alert === "function") window.alert("Set Kolom Tujuan berhasil disimpan.");
-        } catch (_) {}
+        showInlineToast("Set Kolom Tujuan berhasil disimpan.", "success", 1700);
       });
     }
 
@@ -5561,8 +7874,10 @@ Response: ${snippet}`;
   function renderUserTabIfVisible() {
     const tab = document.getElementById(USER_TAB_ID);
     if (!tab || tab.style.display === "none") return;
+    const snapshot = captureUserTabUiState(tab);
     tab.innerHTML = buildUserMarkup();
     bindUserTab(tab);
+    restoreUserTabUiState(tab, snapshot);
   }
 
   function hideUserTab() {
@@ -5633,7 +7948,7 @@ Response: ${snippet}`;
     if (!panel) return false;
     injectUserStyle();
     bindUserNav(panel);
-    renderUserTabIfVisible();
+    queueUserTabRender(0);
     return true;
   }
 
@@ -5683,6 +7998,7 @@ Response: ${snippet}`;
   function boot() {
     const ok = ensurePatchedUi();
     installPanelApproveSourceCapture();
+    installApprovalNetworkSync();
     wrapNativeApprovals();
     startWrapWatcher();
     if (ok) scheduleFlush(0);
@@ -5704,6 +8020,9 @@ Response: ${snippet}`;
   window[PATCH_CLEANUP_KEY] = function cleanupUserTabPatch() {
     stopWrapWatcher();
     stopBootRetry();
+    if (typeof networkSyncCleanup === "function") {
+      try { networkSyncCleanup(); } catch (_) {}
+    }
     if (onlineHandler) {
       window.removeEventListener("online", onlineHandler);
       onlineHandler = null;
