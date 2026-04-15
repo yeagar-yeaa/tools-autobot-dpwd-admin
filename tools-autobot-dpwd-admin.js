@@ -10,6 +10,7 @@
   const DEPO_AUTO_APPROVE_LOCKS_KEY = "__ppDepositAutoApproveLocks_v1";
   const PANEL_APPROVE_CTX_KEY = "__ppGsApproveCtx";
   const PANEL_SHARED_KEY = "__ppPendingShared";
+  const SEARCH_LOADING_GIF_URL = "https://admsrt74adm.com//assets/loading.gif";
   const PANEL_RECENT_IDS = new Map();
   const AUTH_STORAGE_KEY = "__ppUiLoginGate_v1";
   const AUTH_USERNAME = "ADMIN";
@@ -75,6 +76,22 @@
     return acc;
   }, {}));
 
+  const USER_BRIEF_ENDPOINT = (() => {
+    try {
+      return new URL('/process/users/showBrief', getRuntimeOrigin() || window.location.href).toString();
+    } catch (_) {
+      return '/process/users/showBrief';
+    }
+  })();
+
+  const USER_HISTORY_ENDPOINT = (() => {
+    try {
+      return new URL('/process/users/showHistoryDefUsers', getRuntimeOrigin() || window.location.href).toString();
+    } catch (_) {
+      return '/process/users/showHistoryDefUsers';
+    }
+  })();
+
   function normalizeBankCodeList(values) {
     const source = Array.isArray(values) ? values : [values];
     const out = [];
@@ -122,6 +139,28 @@
   function getPanelAjaxHeaders(extra = {}) {
     return Object.assign({ [PANEL_FETCH_MARK_HEADER]: "1" }, extra || {});
   }
+
+  function getUserHistoryDefaultState() {
+    return {
+      open: false,
+      username: '',
+      label: '',
+      fpage: 'depo',
+      source: 'deposit',
+      filter: 'all',
+      betId: '',
+      page: 1,
+      loading: false,
+      abortController: null,
+      html: '',
+      briefHtml: '',
+      detailHtml: '',
+      briefRenderedHtml: '',
+      detailRenderedHtml: '',
+      renderedHtml: ''
+    };
+  }
+
 
   function hasObserveOptOutHeader(headers) {
     try {
@@ -459,6 +498,10 @@ function normalizeBankLabelKey(value) {
     signatures: { depo: "", wd: "" },
     lastLoadedAt: { depo: 0, wd: 0 },
     lastRequestAt: { depo: 0, wd: 0 },
+    pendingFetchHealth: {
+      depo: { streak: 0, cooldownUntil: 0, lastToastAt: 0, lastStatus: 0 },
+      wd: { streak: 0, cooldownUntil: 0, lastToastAt: 0, lastStatus: 0 }
+    },
     autoSyncTimer: 0,
     deferredFlushTimer: 0,
     interactionLockUntil: 0,
@@ -473,6 +516,15 @@ function normalizeBankLabelKey(value) {
     drag: { active: false, startX: 0, startY: 0, left: 0, top: 0, pointerId: null, bound: false },
     lastEscShortcutAt: 0,
     lastSafeWithdrawAlertAt: 0,
+    headerSnapshotSignature: "",
+    headerStyleSignature: "",
+    headerNavSignature: "",
+    headerBoxSignature: "",
+    headerTabText: { depo: "", wd: "", user: "" },
+    hoverInteractiveTarget: null,
+    viewportLock: null,
+    copy: { lastKey: "", lastAt: 0, pendingKey: "", pendingAt: 0, lastToastKey: "", lastToastAt: 0, buffer: null },
+    history: getUserHistoryDefaultState(),
     depo: {
       showAll: true,
       sortBy: "date",
@@ -507,6 +559,39 @@ function normalizeBankLabelKey(value) {
     }
   };
 
+  const OPTIMISTIC_PENDING_ROWS = { depo: new Map(), wd: new Map() };
+
+  function pruneOptimisticPendingRows(type) {
+    const key = type === 'wd' ? 'wd' : 'depo';
+    const bucket = OPTIMISTIC_PENDING_ROWS[key];
+    const nowTs = Date.now();
+    bucket.forEach((expireAt, id) => {
+      if (!expireAt || nowTs >= expireAt) bucket.delete(id);
+    });
+    return bucket;
+  }
+
+  function markOptimisticPendingRow(type, id, ttlMs = 2600) {
+    if (!id) return false;
+    const key = type === 'wd' ? 'wd' : 'depo';
+    const bucket = pruneOptimisticPendingRows(key);
+    bucket.set(String(id), Date.now() + Math.max(900, Number(ttlMs) || 0));
+    return true;
+  }
+
+  function hasOptimisticPendingRow(type, id) {
+    if (!id) return false;
+    const bucket = pruneOptimisticPendingRows(type);
+    const expireAt = bucket.get(String(id)) || 0;
+    return !!expireAt && Date.now() < expireAt;
+  }
+
+  function clearOptimisticPendingRow(type, id) {
+    if (!id) return false;
+    const bucket = pruneOptimisticPendingRows(type);
+    return bucket.delete(String(id));
+  }
+
   injectStyle();
 
   const panel = document.createElement("div");
@@ -515,35 +600,51 @@ function normalizeBankLabelKey(value) {
   panel.innerHTML = `
     <div class="pp-shell" id="ppMainShell">
       <div class="pp-header bg-primary">
-        <div class="pp-headMain">
-          <div class="pp-titleText">Dashboard Admin</div>
-          <div class="pp-nav" id="ppTabs">
-            <button type="button" class="pp-navItem pp-staticNav">Menu</button>
-            <button type="button" class="pp-navItem pp-tabButton is-active" data-tab="depo">Deposit <span class="pp-badge pp-badgeGreen" id="ppDepoBadge">0</span></button>
-            <button type="button" class="pp-navItem pp-tabButton" data-tab="wd">Withdraw <span class="pp-badge pp-badgeAmber" id="ppWdBadge">0</span></button>
+        <div class="pp-headerFluid">
+          <div class="pp-headMain">
+            <button type="button" class="pp-titleText pp-titleBtn" id="ppHeaderBrand"></button>
+            <div class="pp-nav" id="ppTabs"></div>
           </div>
-        </div>
-        <div class="pp-toolbar">
-          <button type="button" class="pp-toolBtn pp-minimizeBtn" id="ppMinimizeBtn" title="Hide content" aria-label="Hide content">
-            <span class="pp-toolIcon pp-toolIconCollapse" aria-hidden="true">
-              <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M5 12L10 7L15 12" />
-              </svg>
-            </span>
-            <span class="pp-toolIcon pp-toolIconExpand" aria-hidden="true">
-              <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M5 8L10 13L15 8" />
-              </svg>
-            </span>
-          </button>
-          <button type="button" class="pp-toolBtn pp-closeBtn" id="ppCloseBtn" title="Close" aria-label="Close panel">
-            <span class="pp-toolIcon" aria-hidden="true">
-              <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M6 6L14 14" />
-                <path d="M14 6L6 14" />
-              </svg>
-            </span>
-          </button>
+          <div class="pp-headerMeta" id="ppHeaderMeta">
+            <div class="pp-headerMetaItem pp-headerUser" id="ppHeaderUserWrap" title="User info">
+              <span class="glyphicon glyphicon-user" aria-hidden="true"></span>
+              <span class="pp-headerUserText">
+                <strong id="ppHeaderUserPrimary"></strong>
+                <span class="pp-headerUserDivider" id="ppHeaderUserDivider">|</span>
+                <span class="pp-headerUserSecondary" id="ppHeaderUserSecondary"></span>
+              </span>
+            </div>
+            <button type="button" class="pp-headerMetaItem pp-headerAction" id="ppHeaderLogoutBtn" title="Logout">
+              <span class="glyphicon glyphicon-log-out" aria-hidden="true"></span>
+              <span id="ppHeaderLogoutText"></span>
+            </button>
+            <div class="pp-headerMetaItem pp-headerClock" id="ppHeaderClockWrap" title="Clock">
+              <span class="glyphicon glyphicon-time" aria-hidden="true"></span>
+              <span id="ppHeaderClockText"></span>
+            </div>
+            <div class="pp-toolbar">
+              <button type="button" class="pp-toolBtn pp-minimizeBtn" id="ppMinimizeBtn" title="Hide content" aria-label="Hide content">
+                <span class="pp-toolIcon pp-toolIconCollapse" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M5 12L10 7L15 12" />
+                  </svg>
+                </span>
+                <span class="pp-toolIcon pp-toolIconExpand" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M5 8L10 13L15 8" />
+                  </svg>
+                </span>
+              </button>
+              <button type="button" class="pp-toolBtn pp-closeBtn" id="ppCloseBtn" title="Close" aria-label="Close panel">
+                <span class="pp-toolIcon" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M6 6L14 14" />
+                    <path d="M14 6L6 14" />
+                  </svg>
+                </span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="pp-content" id="ppContent">
@@ -605,6 +706,13 @@ function normalizeBankLabelKey(value) {
     authCaptchaBtn: panel.querySelector("#verifikasi"),
     mainShell: panel.querySelector("#ppMainShell"),
     header: panel.querySelector(".pp-header"),
+    headerBrand: panel.querySelector("#ppHeaderBrand"),
+    headerUserPrimary: panel.querySelector("#ppHeaderUserPrimary"),
+    headerUserSecondary: panel.querySelector("#ppHeaderUserSecondary"),
+    headerUserDivider: panel.querySelector("#ppHeaderUserDivider"),
+    headerLogoutBtn: panel.querySelector("#ppHeaderLogoutBtn"),
+    headerLogoutText: panel.querySelector("#ppHeaderLogoutText"),
+    headerClockText: panel.querySelector("#ppHeaderClockText"),
     tabs: [...panel.querySelectorAll(".pp-tabButton[data-tab]")],
     depoTab: panel.querySelector("#ppDepoTab"),
     wdTab: panel.querySelector("#ppWdTab"),
@@ -614,6 +722,220 @@ function normalizeBankLabelKey(value) {
     closeBtn: panel.querySelector("#ppCloseBtn")
   };
 
+  ensureUserHistoryLayer();
+
+  function cleanHeaderText(value) {
+    return String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+  }
+
+  function getNativeHeaderNavbar() {
+    return [...document.querySelectorAll("nav.navbar.navbar-expand-lg.navbar-dark.navbar-inverse.bg-primary, nav.navbar.bg-primary")]
+      .find((node) => node && !refs.panel.contains(node)) || null;
+  }
+
+  function readNativeHeaderSnapshot() {
+    const nav = getNativeHeaderNavbar();
+    const fallback = {
+      brand: cleanHeaderText(document.title || ""),
+      userPrimary: cleanHeaderText(refs.authUsername && refs.authUsername.value),
+      userSecondary: "",
+      logoutText: "",
+      clockText: ""
+    };
+    if (!nav) return fallback;
+    const brand = cleanHeaderText(nav.querySelector(".navbar-brand") && nav.querySelector(".navbar-brand").textContent) || fallback.brand;
+    const msAuto = nav.querySelector(".navbar-nav.ms-auto");
+    const userItem = msAuto ? [...msAuto.querySelectorAll(".nav-item")].find((item) => item.querySelector("strong")) : null;
+    const userPrimary = cleanHeaderText(userItem && userItem.querySelector("strong") && userItem.querySelector("strong").textContent) || fallback.userPrimary;
+    let userSecondary = "";
+    if (userItem) {
+      const userText = cleanHeaderText(userItem.textContent || "");
+      userSecondary = cleanHeaderText(userText.replace(userPrimary, "").replace(/^\|\s*/, ""));
+    }
+    const logoutItem = msAuto ? [...msAuto.querySelectorAll(".nav-item")].find((item) => /logout/i.test(cleanHeaderText(item.textContent || ""))) : null;
+    const logoutText = cleanHeaderText(logoutItem && logoutItem.textContent) || fallback.logoutText;
+    const clockText = cleanHeaderText(nav.querySelector("#clock") && nav.querySelector("#clock").textContent) || fallback.clockText;
+    return { brand, userPrimary, userSecondary, logoutText, clockText };
+  }
+
+  function getNativeHeaderStyleSource(nav, selectorList, fallback = null) {
+    if (!nav) return fallback || null;
+    const selectors = Array.isArray(selectorList) ? selectorList : [selectorList];
+    for (const selector of selectors) {
+      try {
+        const node = nav.querySelector(selector);
+        if (node) return node;
+      } catch (_) {}
+    }
+    return fallback || null;
+  }
+
+  function captureComputedTextStyle(element) {
+    if (!element || typeof window.getComputedStyle !== "function") return null;
+    const style = window.getComputedStyle(element);
+    if (!style) return null;
+    return {
+      color: style.color || "",
+      fontFamily: style.fontFamily || "",
+      fontSize: style.fontSize || "",
+      fontWeight: style.fontWeight || "",
+      lineHeight: style.lineHeight || "",
+      letterSpacing: style.letterSpacing || "",
+      textTransform: style.textTransform || "",
+      paddingTop: style.paddingTop || "",
+      paddingRight: style.paddingRight || "",
+      paddingBottom: style.paddingBottom || "",
+      paddingLeft: style.paddingLeft || "",
+      minHeight: style.minHeight || "",
+      height: style.height || ""
+    };
+  }
+
+  function readNativeHeaderStyleSnapshot() {
+    const nav = getNativeHeaderNavbar();
+    if (!nav) return null;
+    const msAuto = nav.querySelector(".navbar-nav.ms-auto");
+    const brandNode = getNativeHeaderStyleSource(nav, [".navbar-brand"]);
+    const navItemNode = getNativeHeaderStyleSource(nav, [".navbar-nav:not(.ms-auto) .nav-item > a", ".navbar-nav:not(.ms-auto) .nav-item a", ".navbar-nav:not(.ms-auto) .nav-item"]);
+    const userNode = getNativeHeaderStyleSource(msAuto || nav, [".nav-item a", ".nav-item"]);
+    const logoutNode = getNativeHeaderStyleSource(msAuto || nav, [".nav-item a[href*='logout']", ".nav-item a", ".nav-item"]);
+    const clockNode = getNativeHeaderStyleSource(msAuto || nav, ["#clock", ".nav-item a", ".nav-item"]);
+    const navStyle = captureComputedTextStyle(navItemNode);
+    const brandStyle = captureComputedTextStyle(brandNode) || navStyle;
+    const userStyle = captureComputedTextStyle(userNode) || navStyle;
+    const logoutStyle = captureComputedTextStyle(logoutNode) || userStyle || navStyle;
+    const clockStyle = captureComputedTextStyle(clockNode) || userStyle || navStyle;
+    return { brandStyle, navStyle, userStyle, logoutStyle, clockStyle };
+  }
+
+  function applyInlineHeaderTextStyle(node, style) {
+    if (!node || !style) return;
+    const map = {
+      color: style.color,
+      fontFamily: style.fontFamily,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight,
+      lineHeight: style.lineHeight,
+      letterSpacing: style.letterSpacing,
+      textTransform: style.textTransform,
+      paddingTop: style.paddingTop,
+      paddingRight: style.paddingRight,
+      paddingBottom: style.paddingBottom,
+      paddingLeft: style.paddingLeft,
+      minHeight: style.minHeight,
+      height: style.height
+    };
+    Object.keys(map).forEach((key) => {
+      const value = map[key];
+      if (!value) return;
+      try { node.style[key] = value; } catch (_) {}
+    });
+  }
+
+  function syncHeaderStylesFromNative(snapshot = null) {
+    if (!isPanelAlive()) return false;
+    snapshot = snapshot || readNativeHeaderStyleSnapshot();
+    if (!snapshot) return false;
+    const signature = JSON.stringify(snapshot || {});
+    if (signature === String(state.headerStyleSignature || "")) return false;
+    state.headerStyleSignature = signature;
+    applyInlineHeaderTextStyle(refs.headerBrand, snapshot.brandStyle || snapshot.navStyle);
+    refs.tabs.forEach((button) => applyInlineHeaderTextStyle(button, snapshot.navStyle));
+    const staticNav = refs.panel.querySelector('.pp-staticNav');
+    applyInlineHeaderTextStyle(staticNav, snapshot.navStyle);
+    applyInlineHeaderTextStyle(refs.headerUserWrap, snapshot.userStyle || snapshot.navStyle);
+    applyInlineHeaderTextStyle(refs.headerLogoutBtn, snapshot.logoutStyle || snapshot.userStyle || snapshot.navStyle);
+    const clockWrap = refs.headerClockText && refs.headerClockText.parentElement ? refs.headerClockText.parentElement : null;
+    applyInlineHeaderTextStyle(clockWrap, snapshot.clockStyle || snapshot.userStyle || snapshot.navStyle);
+    const userTextNodes = [refs.headerUserPrimary, refs.headerUserSecondary, refs.headerUserDivider, refs.headerLogoutText, refs.headerClockText].filter(Boolean);
+    userTextNodes.forEach((node) => {
+      const source = node === refs.headerClockText ? (snapshot.clockStyle || snapshot.userStyle || snapshot.navStyle) : (snapshot.userStyle || snapshot.navStyle);
+      if (!source) return;
+      try {
+        node.style.fontFamily = source.fontFamily || "";
+        node.style.fontSize = source.fontSize || "";
+        node.style.fontWeight = source.fontWeight || "";
+        node.style.lineHeight = source.lineHeight || "";
+        node.style.letterSpacing = source.letterSpacing || "";
+        node.style.textTransform = source.textTransform || "";
+      } catch (_) {}
+    });
+    refs.panel.style.setProperty('--pp-native-header-font-family', (snapshot.navStyle && snapshot.navStyle.fontFamily) || 'Ubuntu, sans-serif');
+    refs.panel.style.setProperty('--pp-native-header-font-size', (snapshot.navStyle && snapshot.navStyle.fontSize) || '12px');
+    refs.panel.style.setProperty('--pp-native-header-weight', (snapshot.navStyle && snapshot.navStyle.fontWeight) || '400');
+    return true;
+  }
+
+  function applyHeaderSnapshot(snapshot = {}) {
+    const brand = cleanHeaderText(snapshot.brand);
+    const userPrimary = cleanHeaderText(snapshot.userPrimary);
+    const userSecondary = cleanHeaderText(snapshot.userSecondary);
+    const logoutText = cleanHeaderText(snapshot.logoutText);
+    const clockText = cleanHeaderText(snapshot.clockText);
+    const signature = [brand, userPrimary, userSecondary, logoutText, clockText].join("\u0001");
+    if (signature === String(state.headerSnapshotSignature || "")) return false;
+    state.headerSnapshotSignature = signature;
+    if (refs.headerBrand) {
+      if (refs.headerBrand.textContent !== brand) refs.headerBrand.textContent = brand;
+      refs.headerBrand.style.display = brand ? "inline-flex" : "none";
+    }
+    if (refs.headerUserPrimary && refs.headerUserPrimary.textContent !== userPrimary) refs.headerUserPrimary.textContent = userPrimary;
+    if (refs.headerUserSecondary && refs.headerUserSecondary.textContent !== userSecondary) refs.headerUserSecondary.textContent = userSecondary;
+    if (refs.headerUserWrap) {
+      refs.headerUserWrap.style.display = userPrimary || userSecondary ? "inline-flex" : "none";
+    }
+    if (refs.headerUserDivider) {
+      const dividerDisplay = userSecondary ? "inline" : "none";
+      if (refs.headerUserDivider.style.display !== dividerDisplay) refs.headerUserDivider.style.display = dividerDisplay;
+    }
+    if (refs.headerLogoutText && refs.headerLogoutText.textContent !== logoutText) refs.headerLogoutText.textContent = logoutText;
+    if (refs.headerLogoutBtn) refs.headerLogoutBtn.style.display = logoutText ? "inline-flex" : "none";
+    if (refs.headerClockText) {
+      if (refs.headerClockText.textContent !== clockText) refs.headerClockText.textContent = clockText;
+      if (refs.headerClockText.parentElement) {
+        const clockDisplay = clockText ? "inline-flex" : "none";
+        if (refs.headerClockText.parentElement.style.display !== clockDisplay) refs.headerClockText.parentElement.style.display = clockDisplay;
+      }
+    }
+    return true;
+  }
+
+  function syncHeaderFromNative(force = false) {
+    if (!isPanelAlive()) return;
+    const textSnapshot = readNativeHeaderSnapshot();
+    const styleSnapshot = readNativeHeaderStyleSnapshot();
+    if (force) {
+      state.headerSnapshotSignature = "";
+      state.headerStyleSignature = "";
+    }
+    applyHeaderSnapshot(textSnapshot);
+    syncHeaderStylesFromNative(styleSnapshot);
+  }
+
+  function startHeaderChromeSync() {
+    syncHeaderFromNative(true);
+    const tick = window.setInterval(() => {
+      try { syncHeaderFromNative(); } catch (_) {}
+    }, 1000);
+    state.cleanupFns.push(() => clearInterval(tick));
+    if (refs.headerBrand && !refs.headerBrand.__ppBound) {
+      refs.headerBrand.__ppBound = true;
+      refs.headerBrand.addEventListener("click", () => {
+        try {
+          if (typeof window.switchMenu === "function") window.switchMenu("menuProvider");
+        } catch (_) {}
+      });
+    }
+    if (refs.headerLogoutBtn && !refs.headerLogoutBtn.__ppBound) {
+      refs.headerLogoutBtn.__ppBound = true;
+      refs.headerLogoutBtn.addEventListener("click", () => {
+        try {
+          if (typeof window.logout === "function") window.logout();
+        } catch (_) {}
+      });
+    }
+  }
+
   function isPanelAlive() {
     return !state.destroyed && !!refs.panel && document.body.contains(refs.panel);
   }
@@ -621,28 +943,131 @@ function normalizeBankLabelKey(value) {
   function getPanelViewportMetrics() {
     const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
     const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
-    const gapX = Math.max(6, Math.min(20, Math.round(vw * 0.01)));
-    const gapY = Math.max(8, Math.min(20, Math.round(vh * 0.014)));
+    const gapX = 0;
+    const gapY = 0;
     const zoom = 1;
     return { vw, vh, gapX, gapY, zoom };
   }
 
   function getPanelSizeFromViewport(vw, vh) {
-    const gapX = Math.max(8, Math.min(28, Math.round(vw * 0.014)));
-    const gapY = Math.max(8, Math.min(20, Math.round(vh * 0.014)));
-    const maxViewportWidth = Math.max(320, vw - (gapX * 2));
-    const widthCap = vw >= 2000 ? 1960 : vw >= 1700 ? 1840 : vw >= 1440 ? 1720 : vw >= 1280 ? 1600 : maxViewportWidth;
+    const width = Math.max(320, vw);
+    const height = state.minimized ? 48 : Math.max(48, vh);
     return {
-      width: Math.max(320, Math.min(maxViewportWidth, widthCap)),
-      height: state.minimized ? 48 : Math.max(48, vh - (gapY * 2)),
-      maxWidth: maxViewportWidth,
-      maxHeight: Math.max(48, vh - (gapY * 2))
+      width,
+      height,
+      maxWidth: width,
+      maxHeight: Math.max(48, vh)
     };
+  }
+
+  function warmSearchLoadingGif() {
+    if (window.__ppSearchLoadingGifWarmed) return;
+    window.__ppSearchLoadingGifWarmed = true;
+    try {
+      const img = new Image();
+      img.decoding = "async";
+      img.loading = "eager";
+      img.referrerPolicy = "strict-origin-when-cross-origin";
+      img.src = SEARCH_LOADING_GIF_URL;
+      if (typeof img.decode === "function") img.decode().catch(() => {});
+    } catch (_) {}
+  }
+
+  function lockPanelViewport() {
+    if (state.viewportLock) return state.viewportLock;
+    const html = document.documentElement;
+    const body = document.body;
+    const prev = {
+      htmlOverflow: html && html.style ? html.style.overflow : "",
+      bodyOverflow: body && body.style ? body.style.overflow : ""
+    };
+    try { if (html && html.style) html.style.overflow = "hidden"; } catch (_) {}
+    try { if (body && body.style) body.style.overflow = "hidden"; } catch (_) {}
+    state.viewportLock = {
+      release() {
+        try { if (html && html.style) html.style.overflow = prev.htmlOverflow; } catch (_) {}
+        try { if (body && body.style) body.style.overflow = prev.bodyOverflow; } catch (_) {}
+      }
+    };
+    return state.viewportLock;
+  }
+
+  function renderSearchLoadingContent(message) {
+    const label = escapeHtml(message || "Loading...");
+    const src = escapeHtml(SEARCH_LOADING_GIF_URL);
+    return `<div class="pp-loadingBlock"><img class="pp-loadingGif" src="${src}" alt="" aria-hidden="true"><div class="pp-loadingText">${label}</div></div>`;
+  }
+
+  function setSearchButtonLoading(button, loading) {
+    if (!button) return;
+    const label = String(button.dataset.ppDefaultLabel || button.textContent || "Search").trim() || "Search";
+    if (!button.dataset.ppDefaultLabel) button.dataset.ppDefaultLabel = label;
+    button.textContent = label;
+    button.classList.toggle("is-loading", !!loading);
   }
 
   function getSyncRequestGap(type) {
     if (state.minimized) return type === state.activeTab ? 2200 : 4200;
     return type === state.activeTab ? 1350 : 2600;
+  }
+
+  function getPendingFetchHealth(type) {
+    const key = type === "depo" ? "depo" : "wd";
+    if (!state.pendingFetchHealth) {
+      state.pendingFetchHealth = {
+        depo: { streak: 0, cooldownUntil: 0, lastToastAt: 0, lastStatus: 0 },
+        wd: { streak: 0, cooldownUntil: 0, lastToastAt: 0, lastStatus: 0 }
+      };
+    }
+    if (!state.pendingFetchHealth[key]) {
+      state.pendingFetchHealth[key] = { streak: 0, cooldownUntil: 0, lastToastAt: 0, lastStatus: 0 };
+    }
+    return state.pendingFetchHealth[key];
+  }
+
+  function getPendingFetchErrorStatus(error) {
+    const directStatus = Number(error && error.status);
+    if (Number.isFinite(directStatus) && directStatus > 0) return directStatus;
+    const message = String(error && (error.message || error) || "");
+    const matched = message.match(/(?:status|failed:)\s*(\d{3})/i) || message.match(/(408|429|500|502|503|504|520|521|522|523|524|525|526)/);
+    return matched ? Number(matched[1]) : 0;
+  }
+
+  function isTransientPendingFetchStatus(status) {
+    return [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526].includes(Number(status || 0));
+  }
+
+  function isTransientPendingFetchError(error) {
+    if (!error || error.name === "AbortError") return false;
+    return isTransientPendingFetchStatus(getPendingFetchErrorStatus(error));
+  }
+
+  function markPendingFetchSuccess(type) {
+    const health = getPendingFetchHealth(type);
+    health.streak = 0;
+    health.cooldownUntil = 0;
+    health.lastStatus = 0;
+  }
+
+  function markPendingFetchFailure(type, error, hasRendered) {
+    const health = getPendingFetchHealth(type);
+    const status = getPendingFetchErrorStatus(error);
+    health.lastStatus = status || 0;
+    health.streak = Math.min(health.streak + 1, 6);
+    const base = type === "wd" ? 900 : 700;
+    const max = type === "wd" ? 7200 : 5600;
+    const cooldownMs = Math.min(max, base * health.streak * health.streak);
+    health.cooldownUntil = Date.now() + cooldownMs;
+
+    if (hasRendered && isTransientPendingFetchStatus(status)) {
+      const now = Date.now();
+      if (now - (health.lastToastAt || 0) > 2200) {
+        health.lastToastAt = now;
+        showPanelToast(`${type === "depo" ? "Deposit" : "Withdraw"} pending server sibuk (${status || "ERR"}), retry otomatis...`, "warn", 1700);
+      }
+    }
+
+    return cooldownMs;
   }
 
   function showPanelToast(message, mode = "info", holdMs = 1800) {
@@ -672,15 +1097,18 @@ function normalizeBankLabelKey(value) {
   }
 
   window.__ppPanelToast = (message, mode, holdMs) => showPanelToast(message, mode, holdMs);
+  installUserHistoryGlobalBridge();
 
-  refs.closeBtn.addEventListener("click", destroyPanel);
-  refs.minimizeBtn.addEventListener("click", toggleMinimize);
+  if (refs.closeBtn) refs.closeBtn.style.display = "none";
+  if (refs.minimizeBtn) refs.minimizeBtn.style.display = "none";
   refs.tabs.forEach((button) => {
     button.addEventListener("click", () => switchTab(button.dataset.tab));
   });
 
   setupDrag();
   setupKeyboardShortcuts();
+  warmSearchLoadingGif();
+  lockPanelViewport();
   window.addEventListener("resize", clampPanel, { passive: true });
   clampPanel();
   initAuthGate();
@@ -808,7 +1236,9 @@ function normalizeBankLabelKey(value) {
     setupDrag();
     setupInteractionGuards();
     bindSafeWithdrawLockGuard();
+    bindSafeWithdrawQuickCopy();
     clampPanel();
+    startHeaderChromeSync();
     syncNativeMenu(state.activeTab);
     loadSection("depo", { initial: true });
     scheduleIdlePreload("wd");
@@ -906,26 +1336,26 @@ function normalizeBankLabelKey(value) {
     style.id = STYLE_ID;
     style.textContent = `
       #${PANEL_ID} {
-        --pp-radius: 3px;
-        --pp-radius-sm: 2px;
+        --pp-radius: 0px;
+        --pp-radius-sm: 0px;
         position: fixed;
-        --pp-panel-gap-x: 10px;
-        --pp-panel-gap-y: 12px;
+        --pp-panel-gap-x: 0px;
+        --pp-panel-gap-y: 0px;
         --pp-panel-zoom: 1;
-        top: var(--pp-panel-gap-y);
-        left: 50%;
-        width: min(1760px, calc(100vw - (var(--pp-panel-gap-x) * 2)));
-        height: calc(100vh - (var(--pp-panel-gap-y) * 2));
-        max-width: calc(100vw - (var(--pp-panel-gap-x) * 2));
-        max-height: calc(100vh - (var(--pp-panel-gap-y) * 2));
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100dvh;
+        max-width: 100vw;
+        max-height: 100dvh;
         background: #fff;
-        border: 1px solid #c9d2dc;
-        box-shadow: 0 20px 40px rgb(0 0 0 / 0.18);
+        border: 0;
+        box-shadow: none;
         z-index: 2147483647;
-        transition: width .18s ease, height .18s ease, left .18s ease, top .18s ease, transform .18s ease;
-        transform: translateX(-50%);
+        transition: none;
+        transform: none;
         overflow: hidden;
-        border-radius: var(--pp-radius);
+        border-radius: 0;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       }
       #${PANEL_ID} .bg-primary {
@@ -938,7 +1368,8 @@ function normalizeBankLabelKey(value) {
       #${PANEL_ID}:not(.is-auth-locked) {
         transform: none;
       }
-      #${PANEL_ID}.is-auth-locked .pp-nav {
+      #${PANEL_ID}.is-auth-locked .pp-nav,
+      #${PANEL_ID}.is-auth-locked .pp-headerMeta {
         visibility: hidden;
         pointer-events: none;
       }
@@ -1222,67 +1653,140 @@ function normalizeBankLabelKey(value) {
         flex-direction: column;
         height: 100%;
         min-height: 0;
+        overflow: hidden;
       }
       #${PANEL_ID} .pp-header {
+        display: block;
+        min-height: 50px;
+        padding: 0;
+        color: #fff;
+        cursor: default;
+        user-select: none;
+        border-bottom: 1px solid rgb(255 255 255 / 0.1);
+        font-family: var(--pp-native-header-font-family, Ubuntu, sans-serif);
+        font-size: var(--pp-native-header-font-size, 12px);
+        font-weight: var(--pp-native-header-weight, 400);
+      }
+      #${PANEL_ID} .pp-headerFluid {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 10px;
-        min-height: 43px;
-        padding: 0 10px 0 12px;
-        color: #fff;
-        cursor: grab;
-        user-select: none;
-        border-bottom: 1px solid rgb(255 255 255 / 0.1);
+        gap: 12px;
+        width: 100%;
+        min-height: 50px;
+        padding: 0 12px;
       }
       #${PANEL_ID} .pp-headMain {
         display: flex;
         align-items: center;
-        gap: 20px;
+        gap: 18px;
         min-width: 0;
         flex: 1 1 auto;
       }
       #${PANEL_ID} .pp-titleText {
-        font-size: 14px;
-        font-weight: 700;
+        display: inline-flex;
+        align-items: center;
+        min-height: 44px;
+        padding: 0 9px;
+        font-size: 18px;
+        font-weight: 500;
         line-height: 1.2;
         white-space: nowrap;
         flex: 0 0 auto;
+        color: #fff;
+        font-family: var(--pp-native-header-font-family, Ubuntu, sans-serif);
+      }
+      #${PANEL_ID} .pp-titleBtn {
+        border: 0;
+        outline: 0;
+        background: transparent;
+        cursor: pointer;
+      }
+      #${PANEL_ID} .pp-titleBtn:hover {
+        opacity: .96;
       }
       #${PANEL_ID} .pp-nav {
         display: flex;
         align-items: stretch;
         gap: 0;
         min-width: 0;
-        flex: 1 1 auto;
+        flex: 0 1 auto;
       }
       #${PANEL_ID} .pp-navItem {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         gap: 6px;
-        min-height: 42px;
-        padding: 0 14px;
+        min-height: 44px;
+        padding: 0 9px;
         border: 0;
         background: transparent;
         color: #fff;
         font-size: 12px;
-        font-weight: 600;
+        font-weight: 400;
         cursor: pointer;
         white-space: nowrap;
         transition: background-color .14s ease, color .14s ease;
+        font-family: var(--pp-native-header-font-family, Ubuntu, sans-serif);
       }
       #${PANEL_ID} .pp-staticNav {
         cursor: default;
       }
       #${PANEL_ID} .pp-tabButton:hover,
-      #${PANEL_ID} .pp-staticNav:hover {
+      #${PANEL_ID} .pp-staticNav:hover,
+      #${PANEL_ID} .pp-headerAction:hover {
         background: rgb(74 16 45 / 0.88);
       }
-      #${PANEL_ID} .pp-toolbar {
+      #${PANEL_ID} .pp-headerMeta {
         display: inline-flex;
         align-items: center;
+        justify-content: flex-end;
         gap: 2px;
+        min-width: 0;
+        flex: 0 1 auto;
+      }
+      #${PANEL_ID} .pp-headerMetaItem {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 44px;
+        padding: 0 9px;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 1;
+        white-space: nowrap;
+        border-radius: var(--pp-radius-sm);
+        font-family: var(--pp-native-header-font-family, Ubuntu, sans-serif);
+      }
+      #${PANEL_ID} .pp-headerMetaItem .glyphicon {
+        font-size: 12px;
+      }
+      #${PANEL_ID} .pp-headerUserText {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      #${PANEL_ID} .pp-headerUserDivider {
+        opacity: .7;
+      }
+      #${PANEL_ID} .pp-headerAction {
+        border: 0;
+        outline: 0;
+        background: transparent;
+        cursor: pointer;
+      }
+      #${PANEL_ID} .pp-headerClock {
+        max-width: 320px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .pp-toolbar {
+        display: none !important;
+        align-items: center;
+        gap: 2px;
+        margin-left: 2px;
       }
       #${PANEL_ID} .pp-toolBtn {
         display: inline-flex;
@@ -1369,14 +1873,25 @@ function normalizeBankLabelKey(value) {
         height: 48px;
         min-height: 48px;
       }
-      #${PANEL_ID}.is-minimized .pp-content {
+      #${PANEL_ID}.is-minimized .pp-content,
+      #${PANEL_ID}.is-minimized .pp-footer {
         display: none;
+      }
+      #${PANEL_ID}.is-minimized .pp-header {
+        border-bottom: 0;
       }
       #${PANEL_ID}.is-minimized .pp-toolIconCollapse {
         display: none;
       }
       #${PANEL_ID}.is-minimized .pp-toolIconExpand {
         display: inline-flex;
+      }
+      #${PANEL_ID}.pp-instantToggle,
+      #${PANEL_ID}.pp-instantToggle *,
+      #${PANEL_ID}.pp-instantToggle *::before,
+      #${PANEL_ID}.pp-instantToggle *::after {
+        transition: none !important;
+        animation: none !important;
       }
       #${PANEL_ID} .pp-sectionHeader h3 {
         margin: 0;
@@ -1427,6 +1942,17 @@ function normalizeBankLabelKey(value) {
       }
       #${PANEL_ID} .pp-filterBar {
         position: relative;
+      }
+      #${PANEL_ID} #ppSectionMain-wd .pp-tableWrap > .alert.alert-danger {
+        margin-bottom: 12px !important;
+        padding: 9px 15px 8px !important;
+      }
+      #${PANEL_ID} #ppSectionMain-wd .pp-tableWrap > .alert.alert-danger > .table,
+      #${PANEL_ID} #ppSectionMain-depo .pp-tableWrap > .well.well-sm > .table {
+        margin-bottom: 0 !important;
+      }
+      #${PANEL_ID} #ppSectionMain-depo .pp-tableWrap > .well.well-sm {
+        margin-bottom: 12px !important;
       }
       #${PANEL_ID} .pp-approvedToolbar {
         display: inline-flex;
@@ -1557,18 +2083,22 @@ function normalizeBankLabelKey(value) {
       }
       #${PANEL_ID} .pp-approvedHistoryInner .pagination a,
       #${PANEL_ID} .pp-approvedHistoryInner .pagination button,
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination span,
       #${PANEL_ID} .pp-approvedHistoryInner [data-pp-approved-page] {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         min-width: 34px;
         height: 32px;
-        padding: 0 10px;
+        padding: 0 12px;
         border: 1px solid #d1d5db;
         background: #fff;
         color: #374151;
         text-decoration: none;
         cursor: pointer;
+        border-radius: 4px;
+        white-space: nowrap;
+        box-shadow: none;
       }
       #${PANEL_ID} .pp-approvedHistoryInner .pagination .active a,
       #${PANEL_ID} .pp-approvedHistoryInner .pagination .active span,
@@ -1577,6 +2107,14 @@ function normalizeBankLabelKey(value) {
         background: #7e224f;
         border-color: #7e224f;
         color: #fff;
+      }
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination .disabled a,
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination .disabled span,
+      #${PANEL_ID} .pp-approvedHistoryInner .pagination .disabled button {
+        opacity: .55;
+        cursor: default;
+        pointer-events: none;
+        background: #f8fafc;
       }
       #${PANEL_ID} .pp-approvedHistoryInner .well,
       #${PANEL_ID} .pp-approvedHistoryInner .alert {
@@ -1661,6 +2199,51 @@ function normalizeBankLabelKey(value) {
         text-align: center;
         color: #475569;
       }
+      #${PANEL_ID} .pp-loadingBlock {
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      #${PANEL_ID} .pp-loadingGif {
+        display: block;
+        width: 46px;
+        height: 46px;
+        object-fit: contain;
+        image-rendering: auto;
+      }
+      #${PANEL_ID} .pp-loadingText {
+        font-weight: 700;
+        letter-spacing: .01em;
+      }
+      #${PANEL_ID} .btn.is-loading {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        pointer-events: none;
+        opacity: 1;
+      }
+      #${PANEL_ID} .pp-btnSpinner {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        flex: 0 0 auto;
+      }
+      #${PANEL_ID} .pp-btnSpinner img {
+        display: block;
+        width: 18px;
+        height: 18px;
+        object-fit: contain;
+      }
+      #${PANEL_ID} .pp-searchBtnLabel {
+        display: inline-flex;
+        align-items: center;
+      }
       #${PANEL_ID} .pp-error {
         padding: 22px 16px;
         text-align: center;
@@ -1701,13 +2284,20 @@ function normalizeBankLabelKey(value) {
       #${PANEL_ID} .table {
         margin-bottom: 0;
       }
-      @media (max-width: 860px) {
-        #${PANEL_ID} .pp-header {
+      @media (max-width: 1180px) {
+        #${PANEL_ID} .pp-headerClock {
+          display: none;
+        }
+      }
+      @media (max-width: 980px) {
+        #${PANEL_ID} .pp-headerFluid {
+          flex-wrap: wrap;
           align-items: flex-start;
           padding-top: 6px;
           padding-bottom: 6px;
         }
         #${PANEL_ID} .pp-headMain {
+          width: 100%;
           flex-direction: column;
           align-items: flex-start;
           gap: 2px;
@@ -1716,9 +2306,26 @@ function normalizeBankLabelKey(value) {
           flex-wrap: wrap;
           margin-left: -10px;
         }
-        #${PANEL_ID} .pp-navItem {
-          min-height: 28px;
+        #${PANEL_ID} .pp-headerMeta {
+          width: 100%;
+          justify-content: flex-start;
+          flex-wrap: wrap;
+          margin-left: -10px;
+        }
+        #${PANEL_ID} .pp-navItem,
+        #${PANEL_ID} .pp-headerMetaItem {
+          min-height: 32px;
           padding: 0 10px;
+        }
+        #${PANEL_ID} .pp-titleText {
+          min-height: 32px;
+          font-size: 16px;
+        }
+      }
+      @media (max-width: 700px) {
+        #${PANEL_ID} .pp-headerUserSecondary,
+        #${PANEL_ID} .pp-headerUserDivider {
+          display: none !important;
         }
       }
       #${PANEL_ID},
@@ -1766,15 +2373,19 @@ function normalizeBankLabelKey(value) {
         max-width: 100%;
       }
       #${PANEL_ID} .pp-header {
-        min-height: 48px;
-        padding: 0 12px 0 14px;
+        min-height: 50px;
+        padding: 0;
+      }
+      #${PANEL_ID} .pp-headerFluid {
+        min-height: 50px;
+        padding: 0 12px;
       }
       #${PANEL_ID} .pp-titleText {
-        font-size: 15px;
+        font-size: 18px;
       }
       #${PANEL_ID} .pp-navItem {
         min-height: 44px;
-        padding: 0 16px;
+        padding: 0 14px;
         font-size: 13px;
       }
       #${PANEL_ID} .pp-tabContent {
@@ -1865,6 +2476,522 @@ function normalizeBankLabelKey(value) {
         justify-content: center;
         white-space: nowrap;
       }
+      #${PANEL_ID} .pp-tableWrap td[align="right"] {
+        white-space: nowrap !important;
+        text-align: right !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td[align="right"] > .btn,
+      #${PANEL_ID} .pp-tableWrap td[align="right"] > button,
+      #${PANEL_ID} .pp-tableWrap td[align="right"] .btn.btn-sm,
+      #${PANEL_ID} .pp-tableWrap td[align="right"] button.btn-sm {
+        float: none !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        width: 23px !important;
+        min-width: 23px !important;
+        height: 25px !important;
+        min-height: 25px !important;
+        padding: 0 !important;
+        margin: 0 0 0 4px !important;
+        vertical-align: middle !important;
+        line-height: 1 !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td[align="right"] > .btn:first-child,
+      #${PANEL_ID} .pp-tableWrap td[align="right"] > button:first-child {
+        margin-left: 0 !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td[align="right"] .glyphicon,
+      #${PANEL_ID} .pp-tableWrap td[align="right"] .btn .glyphicon,
+      #${PANEL_ID} .pp-tableWrap td[align="right"] button .glyphicon {
+        display: block !important;
+        margin: 0 !important;
+        line-height: 1 !important;
+        position: static !important;
+        top: auto !important;
+        left: auto !important;
+        transform: none !important;
+      }
+      #${PANEL_ID} .pp-actionIconBtn,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto > .btn.btn-sm,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto > button.btn-sm {
+        float: none !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        width: 26px !important;
+        min-width: 26px !important;
+        height: 26px !important;
+        min-height: 26px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        border-radius: 6px !important;
+        line-height: 1 !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center {
+        column-gap: 0 !important;
+        row-gap: 0 !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow {
+        display: flex !important;
+        align-items: center !important;
+        flex-wrap: nowrap !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto + .col-auto {
+        margin-left: 2px !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userLeadIconCol {
+        flex: 0 0 auto !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userLeadIconCol + .pp-userLeadIconCol {
+        margin-left: 2px !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userIdentityCol {
+        margin-left: 14px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        min-width: 0 !important;
+        flex: 1 1 auto !important;
+      }
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userIdentityCol > a,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userIdentityCol > span,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userIdentityCol > strong,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userIdentityCol .text-danger,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center.pp-userLeadRow > .pp-userIdentityCol .text-primary {
+        display: inline-block !important;
+        line-height: 1.25 !important;
+        margin-left: 0 !important;
+      }
+      #${PANEL_ID} .pp-safeCopyable {
+        cursor: default !important;
+        transition: box-shadow .12s ease, border-color .12s ease, background-color .12s ease;
+      }
+      #${PANEL_ID} .pp-safeCopyable:hover {
+        border-color: #93c5fd !important;
+        box-shadow: 0 0 0 2px rgb(59 130 246 / .12) !important;
+        background-color: #f8fbff !important;
+      }
+      #${PANEL_ID} .pp-actionIconBtn .glyphicon,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto > .btn.btn-sm .glyphicon,
+      #${PANEL_ID} .pp-tableWrap td .row.align-items-center > .col-auto > button.btn-sm .glyphicon {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin: 0 !important;
+        font-size: 12px !important;
+        line-height: 1 !important;
+      }
+      #${PANEL_ID} .pp-inlineActionRow {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        gap: 2px !important;
+        flex-wrap: nowrap !important;
+        white-space: nowrap !important;
+      }
+      #${PANEL_ID} .pp-inlineActionRow > .btn,
+      #${PANEL_ID} .pp-inlineActionRow > button {
+        flex: 0 0 auto !important;
+        margin: 0 !important;
+      }
+      #${PANEL_ID} #ppDepoTab .pp-tableWrap table thead th:last-child,
+      #${PANEL_ID} #ppDepoTab .pp-tableWrap table tbody td:last-child,
+      #${PANEL_ID} #ppWdTab .pp-tableWrap table thead th:last-child,
+      #${PANEL_ID} #ppWdTab .pp-tableWrap table tbody td:last-child {
+        width: 92px !important;
+        min-width: 92px !important;
+      }
+      #${PANEL_ID} #ppDepoTab .pp-tableWrap table thead th:nth-last-child(2),
+      #${PANEL_ID} #ppDepoTab .pp-tableWrap table tbody td:nth-last-child(2),
+      #${PANEL_ID} #ppWdTab .pp-tableWrap table thead th:nth-last-child(2),
+      #${PANEL_ID} #ppWdTab .pp-tableWrap table tbody td:nth-last-child(2) {
+        width: 112px !important;
+        min-width: 112px !important;
+      }
+      #${PANEL_ID} #ppDepoTab .pp-tableWrap table tbody td:last-child,
+      #${PANEL_ID} #ppWdTab .pp-tableWrap table tbody td:last-child {
+        white-space: nowrap !important;
+      }
+      #${PANEL_ID} .pp-userHistoryLayer {
+        position: absolute;
+        inset: 0;
+        z-index: 80;
+        display: none;
+        background: #eef2f7;
+      }
+      #${PANEL_ID} .pp-userHistoryLayer.is-open {
+        display: block;
+      }
+      #${PANEL_ID} .pp-userHistoryBackdrop {
+        display: none;
+      }
+      #${PANEL_ID} .pp-userHistoryDialog {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        max-width: none;
+        background: #eef2f7;
+        box-shadow: none;
+        display: flex;
+        flex-direction: column;
+        border: 0;
+      }
+      #${PANEL_ID} .pp-userHistoryHead {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 16px;
+        border-bottom: 1px solid #d9e1ea;
+        background: #fff;
+      }
+      #${PANEL_ID} .pp-userHistoryHeadMain {
+        min-width: 0;
+      }
+      #${PANEL_ID} .pp-userHistoryTitle {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 700;
+        color: #111827;
+        line-height: 1.25;
+      }
+      #${PANEL_ID} .pp-userHistoryMeta {
+        display: none;
+        margin-top: 4px;
+        font-size: 12px;
+        color: #6b7280;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} #ppUserHistoryCloseBtn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 36px;
+        padding: 0;
+        border: 0;
+        border-radius: 10px;
+        background: #f3f4f6;
+        color: #475569;
+        box-shadow: none;
+        transition: background-color .14s ease, color .14s ease, transform .14s ease;
+      }
+      #${PANEL_ID} #ppUserHistoryCloseBtn:hover {
+        background: #e5e7eb;
+        color: #111827;
+      }
+      #${PANEL_ID} #ppUserHistoryCloseBtn:active {
+        transform: translateY(.5px);
+      }
+      #${PANEL_ID} #ppUserHistoryCloseBtn .glyphicon {
+        margin: 0;
+        font-size: 14px;
+        line-height: 1;
+      }
+      #${PANEL_ID} .pp-userHistoryBody {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: auto;
+        background: #eef2f7;
+      }
+      #${PANEL_ID} .pp-userHistoryBodyInner {
+        min-height: 100%;
+        padding: 0;
+      }
+      #${PANEL_ID} .pp-userHistorySurface {
+        min-height: 100%;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        overflow: visible;
+        box-shadow: none;
+      }
+      #${PANEL_ID} .pp-userHistoryViewport {
+        min-height: 100%;
+        display: flex;
+        flex-direction: column;
+      }
+      #${PANEL_ID} .pp-userHistoryPrimary {
+        padding: 16px 16px 8px;
+      }
+      #${PANEL_ID} .pp-userHistorySecondary {
+        flex: 1 1 auto;
+        min-height: 0;
+        padding: 0 16px 16px;
+      }
+      #${PANEL_ID} .pp-userHistoryPrimary > *:last-child,
+      #${PANEL_ID} .pp-userHistorySecondary > *:last-child {
+        margin-bottom: 0 !important;
+      }
+      #${PANEL_ID} .pp-userHistoryContent h3 {
+        margin: 0 0 12px;
+        font-size: 24px;
+        line-height: 1.2;
+        color: #1f2937;
+      }
+      #${PANEL_ID} .pp-userHistoryContent #notificationBar,
+      #${PANEL_ID} .pp-userHistoryContent #notifsound,
+      #${PANEL_ID} .pp-userHistoryContent [data-pp-history-hidden="1"] {
+        display: none !important;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .row {
+        margin-left: -8px;
+        margin-right: -8px;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .row > [class*="col-"] {
+        padding-left: 8px;
+        padding-right: 8px;
+      }
+      #${PANEL_ID} .pp-userHistoryPrimary > .row {
+        margin-bottom: 4px;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .well,
+      #${PANEL_ID} .pp-userHistoryContent .alert,
+      #${PANEL_ID} .pp-userHistoryContent .table,
+      #${PANEL_ID} .pp-userHistoryContent .table-responsive,
+      #${PANEL_ID} .pp-userHistoryContent .tableWrap,
+      #${PANEL_ID} .pp-userHistoryContent .pp-tableWrap {
+        width: 100%;
+        max-width: 100%;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .well {
+        margin: 0 0 12px;
+        padding: 12px;
+        background: #fff;
+        border: 1px solid #d9e1ea;
+        border-radius: 4px !important;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .alert {
+        margin: 0 0 12px;
+        border-radius: 4px !important;
+      }
+      #${PANEL_ID} .pp-userHistoryPrimary > .alert.alert-info {
+        margin-bottom: 12px;
+        padding: 12px 14px;
+        border: 1px solid #cfe0ee;
+        background: #eaf4fb;
+        color: #2a5d82;
+      }
+      #${PANEL_ID} .pp-userHistoryPrimary > .alert.alert-info h4 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.25;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .form-inline,
+      #${PANEL_ID} .pp-userHistoryContent .form-group-sm.form-inline {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .form-control,
+      #${PANEL_ID} .pp-userHistoryContent .form-select,
+      #${PANEL_ID} .pp-userHistoryContent input[type="text"],
+      #${PANEL_ID} .pp-userHistoryContent input[type="button"],
+      #${PANEL_ID} .pp-userHistoryContent select,
+      #${PANEL_ID} .pp-userHistoryContent button {
+        max-width: 100%;
+        min-height: 34px;
+        border-radius: 4px !important;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .table-responsive,
+      #${PANEL_ID} .pp-userHistoryContent .tableWrap,
+      #${PANEL_ID} .pp-userHistoryContent .pp-tableWrap {
+        overflow: auto;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .table,
+      #${PANEL_ID} .pp-userHistoryContent table {
+        width: 100%;
+        margin: 0;
+        background: #fff;
+        border-collapse: separate;
+        border-spacing: 0;
+      }
+      #${PANEL_ID} .pp-userHistoryContent table th,
+      #${PANEL_ID} .pp-userHistoryContent table td {
+        padding: 10px 12px !important;
+        vertical-align: middle;
+        border-top: 0;
+        border-bottom: 1px solid #edf1f5;
+      }
+      #${PANEL_ID} .pp-userHistoryContent table thead th,
+      #${PANEL_ID} .pp-userHistoryContent table thead td {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: #f7f8fa;
+        color: #374151;
+        font-weight: 700;
+        white-space: nowrap;
+        border-bottom: 1px solid #dde3ea;
+      }
+      #${PANEL_ID} .pp-userHistoryContent table tbody tr:hover {
+        background: #fafbfc;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        background: transparent;
+        border: 0;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination li,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li,
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.page-item,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.page-item {
+        display: inline-flex;
+        align-items: center;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        border: 0;
+        cursor: pointer;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.active,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.active {
+        cursor: default;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination a,
+      #${PANEL_ID} .pp-userHistoryContent .pagination button,
+      #${PANEL_ID} .pp-userHistoryContent .pagination span,
+      #${PANEL_ID} .pp-userHistoryContent .pagination .page-link,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination a,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination button,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination span,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination .page-link,
+      #${PANEL_ID} .pp-userHistoryContent a[data-pp-user-history-page],
+      #${PANEL_ID} .pp-userHistoryContent button[data-pp-user-history-page],
+      #${PANEL_ID} .pp-userHistoryContent span[data-pp-user-history-page] {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 34px;
+        height: 28px;
+        padding: 0 12px;
+        border: 1px solid #d1d5db;
+        background: #fff;
+        color: #4b5563;
+        text-decoration: none;
+        cursor: inherit;
+        border-radius: 4px;
+        white-space: nowrap;
+        box-shadow: none;
+        font-size: 12px;
+        line-height: 1;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.active a,
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.active span,
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.active button,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.active a,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.active span,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.active button {
+        background: #7e224f;
+        border-color: #7e224f;
+        color: #fff;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.disabled a,
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.disabled span,
+      #${PANEL_ID} .pp-userHistoryContent .pagination li.disabled button,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.disabled a,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.disabled span,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination li.disabled button {
+        opacity: .55;
+        cursor: default;
+        pointer-events: none;
+        background: #f8fafc;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .btn,
+      #${PANEL_ID} .pp-userHistoryContent input[type="button"],
+      #${PANEL_ID} .pp-userHistoryContent input[type="submit"] {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 32px;
+        padding: 0 12px;
+        border-radius: 4px !important;
+        white-space: nowrap;
+        box-shadow: none;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .btn-warning,
+      #${PANEL_ID} .pp-userHistoryContent .btn-warning:hover,
+      #${PANEL_ID} .pp-userHistoryContent .btn-warning:focus {
+        background: #f97316;
+        border-color: #ea580c;
+        color: #fff;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .btn-primary,
+      #${PANEL_ID} .pp-userHistoryContent .btn-primary:hover,
+      #${PANEL_ID} .pp-userHistoryContent .btn-primary:focus {
+        background: #7e224f;
+        border-color: #7e224f;
+        color: #fff;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .btn-default:hover {
+        background: #f8fafc;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination + div,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination + div {
+        display: block;
+        margin-top: 8px;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination + div .btn,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination + div .btn,
+      #${PANEL_ID} .pp-userHistoryContent .pagination + div button,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination + div button,
+      #${PANEL_ID} .pp-userHistoryContent .pagination + div a,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination + div a {
+        min-height: 31px;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pp-tableWrap {
+        border: 1px solid #dde3ea;
+        border-radius: 4px;
+        background: #fff;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pp-tableWrap table {
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .pagination + .btn,
+      #${PANEL_ID} .pp-userHistoryContent .pagination + .btn-warning,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination + .btn,
+      #${PANEL_ID} .pp-userHistoryContent ul.pagination + .btn-warning {
+        margin-top: 8px;
+      }
+      #${PANEL_ID} .pp-userHistoryContent .text-danger,
+      #${PANEL_ID} .pp-userHistoryContent .label-danger {
+        color: #b91c1c;
+      }
+      #${PANEL_ID} .pp-userHistoryFilterNote {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #6b7280;
+      }
+      #${PANEL_ID} .pp-userHistoryEmpty,
+      #${PANEL_ID} .pp-userHistoryError {
+        padding: 20px;
+        color: #475569;
+        background: #fff;
+      }
       #${PANEL_ID}, #${PANEL_ID} * {
         scrollbar-width: none;
         -ms-overflow-style: none;
@@ -1880,6 +3007,41 @@ function normalizeBankLabelKey(value) {
     document.head.appendChild(style);
   }
 
+  function getInteractiveHoverTarget(node) {
+    if (!node || typeof node.closest !== "function") return null;
+    return node.closest([
+      "button",
+      "a",
+      "input",
+      "select",
+      "textarea",
+      "label",
+      "summary",
+      ".btn",
+      ".pp-navItem",
+      ".pp-headerAction",
+      ".pp-toolBtn",
+      ".pp-bankMenu",
+      ".pp-bankMenuWrap",
+      ".pp-userHistoryControls",
+      ".pagination",
+      ".page-link",
+      "[role='button']",
+      "[data-bank-action]"
+    ].join(","));
+  }
+
+  function setHoverInteractiveTarget(node) {
+    const target = getInteractiveHoverTarget(node);
+    if (target && refs.panel && refs.panel.contains(target)) {
+      state.hoverInteractiveTarget = target;
+      state.lastInteractionAt = Date.now();
+      return target;
+    }
+    state.hoverInteractiveTarget = null;
+    return null;
+  }
+
   function markInteracting(duration = 520) {
     const ts = Date.now();
     state.lastInteractionAt = ts;
@@ -1889,9 +3051,13 @@ function normalizeBankLabelKey(value) {
   function isInteractionLocked(type) {
     const activeEl = document.activeElement;
     const tab = type === "depo" ? refs.depoTab : refs.wdTab;
+    const hoverTarget = state.hoverInteractiveTarget;
     if (state.drag.active) return true;
     if (Date.now() < (state.interactionLockUntil || 0)) return true;
     if (tab && tab.querySelector(".pp-bankMenu.is-open")) return true;
+    if (type === state.activeTab && hoverTarget && hoverTarget.isConnected && refs.panel.contains(hoverTarget)) {
+      return true;
+    }
     if (type === state.activeTab && activeEl && refs.panel.contains(activeEl) && activeEl.closest("input, select, textarea, button, label, a, .pp-bankMenu")) {
       return true;
     }
@@ -1921,12 +3087,28 @@ function normalizeBankLabelKey(value) {
     const softLock = () => markInteracting(360);
     const hardLock = () => markInteracting(820);
     const flushLater = () => scheduleDeferredFlush();
+    const syncHoverTarget = (event) => {
+      const nextTarget = setHoverInteractiveTarget(event && event.target);
+      if (nextTarget) markInteracting(980);
+    };
+    const releaseHoverTarget = (event) => {
+      const related = event && event.relatedTarget;
+      const nextTarget = related ? getInteractiveHoverTarget(related) : null;
+      if (nextTarget && refs.panel.contains(nextTarget)) {
+        state.hoverInteractiveTarget = nextTarget;
+        return;
+      }
+      state.hoverInteractiveTarget = null;
+      scheduleDeferredFlush();
+    };
 
     refs.panel.addEventListener("pointerdown", hardLock, true);
     refs.panel.addEventListener("focusin", hardLock, true);
     refs.panel.addEventListener("input", hardLock, true);
     refs.panel.addEventListener("change", hardLock, true);
     refs.panel.addEventListener("keydown", hardLock, true);
+    refs.panel.addEventListener("pointerover", syncHoverTarget, true);
+    refs.panel.addEventListener("pointerout", releaseHoverTarget, true);
     refs.panel.addEventListener("wheel", softLock, { passive: true, capture: true });
     refs.panel.addEventListener("scroll", softLock, { passive: true, capture: true });
     refs.panel.addEventListener("focusout", flushLater, true);
@@ -1935,6 +3117,8 @@ function normalizeBankLabelKey(value) {
     window.addEventListener("touchend", flushLater, { passive: true });
 
     state.cleanupFns.push(() => refs.panel.removeEventListener("focusout", flushLater, true));
+    state.cleanupFns.push(() => refs.panel.removeEventListener("pointerover", syncHoverTarget, true));
+    state.cleanupFns.push(() => refs.panel.removeEventListener("pointerout", releaseHoverTarget, true));
     state.cleanupFns.push(() => window.removeEventListener("pointerup", flushLater));
     state.cleanupFns.push(() => window.removeEventListener("mouseup", flushLater));
     state.cleanupFns.push(() => window.removeEventListener("touchend", flushLater));
@@ -1975,6 +3159,21 @@ function normalizeBankLabelKey(value) {
         menu.classList.add("is-open");
       }
     });
+  }
+
+  function rerenderSectionFromCache(type) {
+    const cfg = state[type];
+    if (!cfg || !cfg.responseHtml) return false;
+    const parsed = parsePendingResponse(type, cfg.responseHtml);
+    cfg.bankCounts = parsed.bankCounts;
+    cfg.total = parsed.total;
+    cfg.availableBanks = parsed.availableBanks || cfg.availableBanks || [];
+    state.fingerprints[type] = parsed.fingerprint;
+    state.signatures[type] = parsed.signature;
+    renderSectionIntoTab(type, parsed);
+    updateBadges();
+    if (type === "depo") renderDepositAutoApproveUi(refs.depoTab);
+    return true;
   }
 
   function renderSectionIntoTab(type, parsed) {
@@ -2063,9 +3262,14 @@ function normalizeBankLabelKey(value) {
     return !!(userTab && userTab.style.display !== "none");
   }
 
+  function isUserHistoryDialogOpen() {
+    return !!(refs.historyLayer && refs.historyLayer.classList.contains("is-open") && state.history && state.history.open);
+  }
+
   function maybeAutoRefresh(type, now, minAge) {
     if (!isPanelAlive() || document.hidden) return;
-    if (isUserTabVisible()) return;
+    if (isUserTabVisible() || isUserHistoryDialogOpen()) return;
+    if (state.hoverInteractiveTarget && state.hoverInteractiveTarget.isConnected && refs.panel.contains(state.hoverInteractiveTarget)) return;
     if (type === "depo" && state.depo.autoApproveBusy) return;
     if (state.minimized && type !== state.activeTab) return;
     if (flushDeferredRender(type)) return;
@@ -2079,6 +3283,7 @@ function normalizeBankLabelKey(value) {
 
   function resumeActiveSync(forceRefresh) {
     if (!isPanelAlive() || document.hidden) return;
+    if (isUserHistoryDialogOpen()) return;
     if (!state.autoSyncTimer) startAutoSync();
     const activeType = state.activeTab;
     if (activeType === "depo" && state.depo.autoApproveBusy) return;
@@ -2133,6 +3338,10 @@ function normalizeBankLabelKey(value) {
     const previousHeight = Math.max(tab.offsetHeight || 0, 220);
     const requestGap = options.initial ? 0 : (options.silent ? getSyncRequestGap(type) : 420);
     const nowTs = Date.now();
+    const fetchHealth = getPendingFetchHealth(type);
+    if (hasRendered && !options.force && nowTs < (fetchHealth.cooldownUntil || 0)) {
+      return false;
+    }
     if (hasRendered && !options.force && (nowTs - (state.lastRequestAt[type] || 0) < requestGap)) {
       return false;
     }
@@ -2164,6 +3373,7 @@ function normalizeBankLabelKey(value) {
         ? await fetchPendingDeposit(cfg, controller.signal)
         : await fetchPendingWithdraw(cfg, controller.signal);
 
+      markPendingFetchSuccess(type);
       if (token !== state.loadToken[type]) return;
       const previousHtml = cfg.responseHtml || "";
       if (hasRendered && response === previousHtml) {
@@ -2201,6 +3411,21 @@ function normalizeBankLabelKey(value) {
       }
     } catch (error) {
       if (error && error.name === "AbortError") return;
+      const retryDelay = markPendingFetchFailure(type, error, !!hasRendered);
+      if (isTransientPendingFetchError(error)) {
+        if (token === state.loadToken[type] && !hasRendered) {
+          tab.innerHTML = `<div class="pp-loading">${type === "depo" ? "Deposit" : "Withdraw"} pending server sibuk, retry otomatis...</div>`;
+          tab.dataset.rendered = "0";
+        }
+        if (token === state.loadToken[type] && isPanelAlive() && isAuthenticated()) {
+          window.setTimeout(() => {
+            if (!isPanelAlive() || !isAuthenticated()) return;
+            if (state.loadToken[type] !== token) return;
+            loadSection(type, { busyText: "Retrying...", silent: !!hasRendered, force: true });
+          }, Math.max(type === "wd" ? 850 : 650, retryDelay || 0));
+        }
+        return;
+      }
       console.error(`[${PANEL_ID}] ${type} load failed`, error);
       if (token === state.loadToken[type] && !hasRendered) {
         tab.innerHTML = `<div class="pp-error">Gagal memuat ${type === "depo" ? "Deposit" : "Withdraw"}</div>`;
@@ -2322,9 +3547,11 @@ function normalizeBankLabelKey(value) {
 
   function filterPendingRows(type, rows, availableBanks = []) {
     const cfg = getStateSection(type);
-    if (!cfg.hasBankSelection) return rows.slice();
     const selected = new Set((cfg.banks || []).map((value) => String(value)));
-    return rows.filter((row) => {
+    return (Array.isArray(rows) ? rows : []).filter((row) => {
+      const rowId = extractRowId(row, type === 'wd' ? 'withdrawPending-' : 'depositPending-');
+      if (hasOptimisticPendingRow(type, rowId)) return false;
+      if (!cfg.hasBankSelection) return true;
       const meta = extractRowBankMeta(type, row, availableBanks);
       return meta.value && selected.has(String(meta.value));
     });
@@ -2679,7 +3906,7 @@ function normalizeBankLabelKey(value) {
       : '<div class="pp-empty">Belum ada history deposit approved.</div>');
 
     return `
-      <div class="pp-sectionBody" style="margin-top:22px;">
+      <div class="pp-sectionBody" style="margin-top:8px;">
         <div class="alert alert-success pp-alert" style="margin-bottom:0;border-color:#d6e9c6;border-radius:4px 4px 0 0 !important;">
           <div class="row align-items-center">
             <div class="col">
@@ -2753,8 +3980,7 @@ function normalizeBankLabelKey(value) {
 
     searchButtons.forEach((button) => {
       button.disabled = hardBusy;
-      button.textContent = "Search";
-      button.classList.toggle("is-loading", !!approved.loading);
+      setSearchButtonLoading(button, hardBusy);
     });
 
     if (clearButton) clearButton.disabled = hardBusy;
@@ -2895,7 +4121,7 @@ function normalizeBankLabelKey(value) {
     syncDepositApprovedControls(tab);
 
     if (body && (!approved.html || (options.forceBusy && !silent))) {
-      const loadingMarkup = renderDepositApprovedBody(`<div class="pp-loading">${escapeHtml(options.busyText || "Loading deposit approved...")}</div>`);
+      const loadingMarkup = renderDepositApprovedBody(`<div class="pp-loading">${renderSearchLoadingContent(options.busyText || "Loading deposit approved...")}</div>`);
       if (loadingMarkup !== approved.renderedHtml) {
         body.innerHTML = loadingMarkup;
         approved.renderedHtml = loadingMarkup;
@@ -3005,7 +4231,7 @@ function normalizeBankLabelKey(value) {
         if (formSelect) formSelect.value = approved.form;
         if (valueInput) valueInput.value = approved.val;
         if (indicatorSelect) indicatorSelect.value = approved.indicator;
-        if (body) body.innerHTML = renderDepositApprovedBody('<div class="pp-loading">Loading deposit approved...</div>');
+        if (body) body.innerHTML = renderDepositApprovedBody(`<div class="pp-loading">${renderSearchLoadingContent("Loading deposit approved...")}</div>`);
         runSearch(1, true);
       });
     }
@@ -3194,7 +4420,7 @@ function normalizeBankLabelKey(value) {
       : renderWithdrawApprovedBody('<div class="pp-empty">Belum ada history withdraw approved.</div>');
 
     return `
-      <div class="pp-sectionBody" style="margin-top:22px;">
+      <div class="pp-sectionBody" style="margin-top:8px;">
         <div class="alert alert-danger pp-alert" style="margin-bottom:0;border-color:#eed3d7;border-radius:4px 4px 0 0 !important;">
           <div class="row align-items-center">
             <div class="col">
@@ -3260,8 +4486,7 @@ function normalizeBankLabelKey(value) {
 
     searchButtons.forEach((button) => {
       button.disabled = hardBusy;
-      button.textContent = "Search";
-      button.classList.toggle("is-loading", !!approved.loading);
+      setSearchButtonLoading(button, hardBusy);
     });
 
     if (clearButton) clearButton.disabled = hardBusy;
@@ -3409,7 +4634,7 @@ function normalizeBankLabelKey(value) {
     syncWithdrawApprovedControls(tab);
 
     if (body && (!approved.html || (options.forceBusy && !silent))) {
-      const loadingMarkup = renderWithdrawApprovedBody(`<div class="pp-loading">${escapeHtml(options.busyText || "Loading withdraw approved...")}</div>`);
+      const loadingMarkup = renderWithdrawApprovedBody(`<div class="pp-loading">${renderSearchLoadingContent(options.busyText || "Loading withdraw approved...")}</div>`);
       if (loadingMarkup !== approved.renderedHtml) {
         body.innerHTML = loadingMarkup;
         approved.renderedHtml = loadingMarkup;
@@ -3516,7 +4741,7 @@ function normalizeBankLabelKey(value) {
         if (toInput) toInput.value = approved.to;
         if (formSelect) formSelect.value = approved.form;
         if (valueInput) valueInput.value = approved.val;
-        if (body) body.innerHTML = '<div class="pp-loading">Loading withdraw approved...</div>';
+        if (body) body.innerHTML = renderWithdrawApprovedBody(`<div class="pp-loading">${renderSearchLoadingContent("Loading withdraw approved...")}</div>`);
         runSearch(1, true);
       });
     }
@@ -3652,6 +4877,131 @@ function normalizeBankLabelKey(value) {
     };
   }
 
+  function getHistoryKindMeta(value) {
+    const key = String(value || '').toLowerCase() === 'wd' ? 'wd' : 'depo';
+    return key === 'wd'
+      ? { type: 'wd', fpage: 'wd', source: 'withdraw', label: 'Withdraw' }
+      : { type: 'depo', fpage: 'depo', source: 'deposit', label: 'Deposit' };
+  }
+
+  function extractHistoryTriggerData(raw, fallbackType) {
+    const onclick = String(raw || '').trim();
+    if (!onclick) return null;
+    const matched = onclick.match(/showHistory(?:Depo|WD)\(\s*['"]?([^,'")]+)['"]?\s*,\s*['"]?(depo|wd)['"]?\s*\)/i);
+    if (!matched) return null;
+    const username = String(matched[1] || '').trim();
+    if (!username) return null;
+    const meta = getHistoryKindMeta(matched[2] || fallbackType);
+    return { username, fpage: meta.fpage, source: meta.source, type: meta.type, label: meta.label };
+  }
+
+  function normalizeActionIconButton(button) {
+    if (!button) return;
+    button.classList.add('pp-actionIconBtn');
+    ['float', 'padding-left', 'padding-right', 'padding-top', 'padding-bottom', 'margin-top', 'margin-right', 'margin-left', 'margin-bottom', 'width', 'height'].forEach((prop) => {
+      try { button.style.removeProperty(prop); } catch (_) {}
+    });
+  }
+
+  function normalizeActionButtonsLayout(root) {
+    if (!root) return;
+    root.querySelectorAll("td[align='right'] > .btn, td[align='right'] > button, td[align='right'] .btn.btn-sm, td[align='right'] button.btn-sm, .row.align-items-center > .col-auto > .btn.btn-sm, .row.align-items-center > .col-auto > button.btn-sm").forEach((button) => {
+      normalizeActionIconButton(button);
+    });
+  }
+
+  function normalizePendingActionCellRows(root, type) {
+    if (!root) return;
+    const rowSelector = type === 'wd' ? 'tr[id^="withdrawPending-"]' : 'tr[id^="depositPending-"]';
+    root.querySelectorAll(rowSelector).forEach((row) => {
+      const cells = [...row.children].filter((node) => node && /^(TD|TH)$/i.test(node.tagName || ''));
+      const actionCell = cells.length ? cells[cells.length - 1] : null;
+      if (!actionCell) return;
+      const directButtons = [...actionCell.children].filter((node) => node && /^(BUTTON)$/i.test(node.tagName || '') || (node && node.classList && node.classList.contains('btn')));
+      if (directButtons.length < 2) return;
+      let wrap = [...actionCell.children].find((node) => node && node.classList && node.classList.contains('pp-inlineActionRow')) || null;
+      if (!wrap) {
+        wrap = document.createElement('div');
+        wrap.className = 'pp-inlineActionRow';
+        directButtons.forEach((button) => wrap.appendChild(button));
+        actionCell.appendChild(wrap);
+      }
+      directButtons.forEach((button) => normalizeActionIconButton(button));
+    });
+  }
+
+  function normalizePendingUserLeadRows(root) {
+    if (!root) return;
+    root.querySelectorAll('.pp-tableWrap td .row.align-items-center, td .row.align-items-center').forEach((row) => {
+      const children = [...row.children].filter((node) => node && /^DIV$/i.test(node.tagName || ''));
+      if (children.length < 3) return;
+      children.forEach((child) => child.classList.remove('pp-userLeadIconCol', 'pp-userIdentityCol'));
+      row.classList.remove('pp-userLeadRow');
+      let seenLeadIcons = 0;
+      let identityCol = null;
+      for (const child of children) {
+        const hasButton = !!child.querySelector('button, .btn');
+        const hasLeadIcon = !!child.querySelector('.glyphicon-calendar, .glyphicon-search, .pp-historyTrigger');
+        if (!identityCol && hasButton && hasLeadIcon) {
+          child.classList.add('pp-userLeadIconCol');
+          seenLeadIcons += 1;
+          continue;
+        }
+        if (seenLeadIcons >= 1) {
+          identityCol = child;
+          break;
+        }
+      }
+      if (!identityCol || seenLeadIcons < 1) return;
+      row.classList.add('pp-userLeadRow');
+      identityCol.classList.add('pp-userIdentityCol');
+    });
+  }
+
+  function normalizePendingColumnWidths(root) {
+    if (!root) return;
+    root.querySelectorAll('table').forEach((table) => {
+      const headerRows = [...table.querySelectorAll('thead tr')].filter((row) => row.children && row.children.length >= 2);
+      const headerRow = headerRows[0] || null;
+      if (!headerRow) return;
+      const headCells = [...headerRow.children].filter((node) => node && /^(TH|TD)$/i.test(node.tagName || ''));
+      if (headCells.length < 2) return;
+      const actionIndex = headCells.length - 1;
+      const approvalIndex = headCells.length - 2;
+      const bodyRows = [...table.querySelectorAll('tbody tr')].filter((row) => row.children && row.children.length >= headCells.length);
+      const applyWidth = (cell, width) => {
+        if (!cell) return;
+        cell.style.setProperty('width', width, 'important');
+        cell.style.setProperty('min-width', width, 'important');
+      };
+      applyWidth(headCells[actionIndex], '92px');
+      applyWidth(headCells[approvalIndex], '112px');
+      bodyRows.forEach((row) => {
+        applyWidth(row.children[actionIndex], '92px');
+        applyWidth(row.children[approvalIndex], '112px');
+      });
+    });
+  }
+
+  function markHistoryTriggerButton(button, type) {
+    if (!button) return;
+    const data = extractHistoryTriggerData(button.getAttribute('onclick') || '', type);
+    if (!data) return;
+    button.dataset.ppHistoryUsername = data.username;
+    button.dataset.ppHistoryFpage = data.fpage;
+    button.dataset.ppHistorySource = data.source;
+    button.dataset.ppHistoryType = data.type;
+    button.setAttribute('type', 'button');
+    button.setAttribute('title', `${data.label} history`);
+    button.setAttribute('aria-label', `${data.label} history`);
+    button.removeAttribute('onclick');
+    button.removeAttribute('data-toggle');
+    button.removeAttribute('data-placement');
+    button.removeAttribute('data-bs-original-title');
+    button.classList.add('pp-historyTrigger');
+    normalizeActionIconButton(button);
+  }
+
   function sanitizeBlock(type, node, isAction) {
     const cloned = node.cloneNode(true);
     cloned.querySelectorAll("script").forEach((script) => script.remove());
@@ -3664,7 +5014,7 @@ function normalizeBankLabelKey(value) {
         input.removeAttribute("onclick");
         input.value = extractRowId(input.closest("tr"), "depositPending-");
       });
-      cloned.querySelectorAll("#depositPendingActionButtons button").forEach((button) => button.removeAttribute("onclick"));
+      cloned.querySelectorAll("#depositPendingActionButtons button:not([onclick*='showHistoryDepo(']):not([onclick*='showHistoryWD('])").forEach((button) => button.removeAttribute("onclick"));
       cloned.querySelectorAll(".deporekform").forEach((input) => input.removeAttribute("onclick"));
       cloned.querySelectorAll(".fmdepo").forEach((input) => input.removeAttribute("onclick"));
       cloned.querySelectorAll(".bonusevent").forEach((select) => select.removeAttribute("onchange"));
@@ -3673,10 +5023,19 @@ function normalizeBankLabelKey(value) {
         input.removeAttribute("onclick");
         input.value = extractRowId(input.closest("tr"), "withdrawPending-");
       });
-      cloned.querySelectorAll("#withdrawPendingActionButtons button").forEach((button) => button.removeAttribute("onclick"));
+      cloned.querySelectorAll("#withdrawPendingActionButtons button:not([onclick*='showHistoryDepo(']):not([onclick*='showHistoryWD('])").forEach((button) => button.removeAttribute("onclick"));
       cloned.querySelectorAll("[onclick^='wdrekformSelect']").forEach((el) => el.removeAttribute("onclick"));
       cloned.querySelectorAll(".bonusturnover").forEach((select) => select.removeAttribute("onchange"));
     }
+
+    normalizeActionButtonsLayout(cloned);
+    normalizePendingActionCellRows(cloned, type);
+    cloned.querySelectorAll("button[onclick*='showHistoryDepo('], button[onclick*='showHistoryWD(']").forEach((button) => {
+      markHistoryTriggerButton(button, type);
+    });
+    normalizePendingActionCellRows(cloned, type);
+    normalizePendingUserLeadRows(cloned);
+    normalizePendingColumnWidths(cloned);
 
     if (!isAction) {
       cloned.querySelectorAll("[data-toggle='tooltip']").forEach((el) => {
@@ -3687,6 +5046,496 @@ function normalizeBankLabelKey(value) {
     }
 
     return cloned.outerHTML;
+  }
+
+  function readUserHistoryState() {
+    if (!state.history || typeof state.history !== 'object') {
+      state.history = getUserHistoryDefaultState();
+      return state.history;
+    }
+    const defaults = getUserHistoryDefaultState();
+    state.history.open = !!state.history.open;
+    state.history.username = String(state.history.username || defaults.username);
+    state.history.label = String(state.history.label || defaults.label);
+    state.history.fpage = String(state.history.fpage || defaults.fpage) === 'wd' ? 'wd' : 'depo';
+    state.history.source = String(state.history.source || defaults.source).toLowerCase() === 'withdraw' ? 'withdraw' : 'deposit';
+    state.history.filter = String(state.history.filter || defaults.filter || 'all');
+    state.history.page = Math.max(1, parseInt(state.history.page, 10) || 1);
+    state.history.loading = !!state.history.loading;
+    state.history.abortController = state.history.abortController || null;
+    state.history.html = String(state.history.html || '');
+    state.history.renderedHtml = String(state.history.renderedHtml || '');
+    return state.history;
+  }
+
+  function ensureUserHistoryLayer() {
+    if (!refs || !refs.panel) return null;
+    if (refs.historyLayer && refs.historyLayer.isConnected) return refs.historyLayer;
+    const layer = document.createElement('div');
+    layer.id = 'ppUserHistoryLayer';
+    layer.className = 'pp-userHistoryLayer';
+    layer.innerHTML = `
+      <div class="pp-userHistoryBackdrop" data-pp-history-close="1"></div>
+      <div class="pp-userHistoryDialog" role="dialog" aria-modal="true" aria-labelledby="ppUserHistoryTitle">
+        <div class="pp-userHistoryHead">
+          <div class="pp-userHistoryHeadMain">
+            <h3 class="pp-userHistoryTitle" id="ppUserHistoryTitle">History</h3>
+            <div class="pp-userHistoryMeta" id="ppUserHistoryMeta"></div>
+          </div>
+          <button type="button" class="btn btn-default" id="ppUserHistoryCloseBtn" aria-label="Close history" title="Close history"><span class="glyphicon glyphicon-remove"></span></button>
+        </div>
+        <div class="pp-userHistoryBody" id="ppUserHistoryBody"></div>
+      </div>
+    `;
+    refs.panel.appendChild(layer);
+    refs.historyLayer = layer;
+    refs.historyMeta = layer.querySelector('#ppUserHistoryMeta');
+    refs.historyTitle = layer.querySelector('#ppUserHistoryTitle');
+    refs.historyBody = layer.querySelector('#ppUserHistoryBody');
+    refs.historyCloseBtn = layer.querySelector('#ppUserHistoryCloseBtn');
+    layer.addEventListener('click', (event) => {
+      const closeTrigger = event.target.closest('[data-pp-history-close="1"], #ppUserHistoryCloseBtn');
+      if (!closeTrigger) return;
+      event.preventDefault();
+      closeUserHistory();
+    });
+    refs.historyBody.addEventListener('click', (event) => {
+      const pageTrigger = event.target.closest('[data-pp-user-history-page]');
+      if (pageTrigger) {
+        event.preventDefault();
+        markInteracting(1200);
+        const page = Math.max(1, parseInt(pageTrigger.getAttribute('data-pp-user-history-page') || '1', 10) || 1);
+        loadUserHistory({ page, refreshBrief: false, forceBusy: false });
+        return;
+      }
+      const submitTrigger = event.target.closest('[data-pp-user-history-submit]');
+      if (submitTrigger) {
+        event.preventDefault();
+        markInteracting(820);
+        applyUserHistoryLocalFilters();
+      }
+    });
+    refs.historyBody.addEventListener('change', (event) => {
+      const filterTrigger = event.target.closest('[data-pp-user-history-filter]');
+      if (!filterTrigger) return;
+      markInteracting(820);
+      applyUserHistoryLocalFilters();
+    });
+    refs.historyBody.addEventListener('keydown', (event) => {
+      const input = event.target.closest('[data-pp-user-history-betid]');
+      if (!input || event.key !== 'Enter') return;
+      event.preventDefault();
+      markInteracting(820);
+      applyUserHistoryLocalFilters();
+    });
+    return layer;
+  }
+
+  function syncUserHistoryMeta() {
+    ensureUserHistoryLayer();
+    const history = readUserHistoryState();
+    if (refs.historyTitle) {
+      refs.historyTitle.textContent = `${history.label || (history.source === 'withdraw' ? 'Withdraw' : 'Deposit')} History`;
+    }
+    if (refs.historyMeta) {
+      refs.historyMeta.textContent = '';
+      refs.historyMeta.style.display = 'none';
+    }
+  }
+
+
+  function applyUserHistoryLocalFilters() {
+    if (!refs || !refs.historyBody) return false;
+    const filterSelect = refs.historyBody.querySelector('[data-pp-user-history-filter]');
+    const betIdInput = refs.historyBody.querySelector('[data-pp-user-history-betid]');
+    const filter = String(filterSelect && filterSelect.value || 'all').trim() || 'all';
+    const betId = String(betIdInput && betIdInput.value || '').trim();
+    markInteracting(900);
+    loadUserHistory({
+      filter,
+      betId,
+      page: 1,
+      refreshBrief: false,
+      forceBusy: false
+    }).catch(() => {});
+    return true;
+  }
+
+  function closeUserHistory() {
+    markInteracting(520);
+    const history = readUserHistoryState();
+    history.open = false;
+    if (history.abortController) {
+      try { history.abortController.abort(); } catch (_) {}
+      history.abortController = null;
+    }
+    if (refs.historyLayer) refs.historyLayer.classList.remove('is-open');
+    resumeActiveSync(false);
+  }
+
+  function extractUserHistoryPageFromNode(node) {
+    if (!node) return 0;
+    const dataPage = parseInt(node.getAttribute && node.getAttribute('data-page') || '', 10);
+    if (Number.isFinite(dataPage) && dataPage > 0) return dataPage;
+
+    const samples = [
+      node.getAttribute && node.getAttribute('onclick') || '',
+      node.getAttribute && node.getAttribute('href') || '',
+      node.textContent || ''
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+
+    for (const sample of samples) {
+      const hrefMatch = sample.match(/[?&]page=(\d+)/i);
+      if (hrefMatch) return Math.max(1, parseInt(hrefMatch[1], 10) || 1);
+
+      const showHistoryUserMatch = sample.match(/showHistoryUser\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]?(\d+)['\"]?\s*,/i);
+      if (showHistoryUserMatch) return Math.max(1, parseInt(showHistoryUserMatch[1], 10) || 1);
+
+      const defUsersMatch = sample.match(/showHistoryDefUsers\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]?(?:depo|wd)['\"]?\s*,\s*['\"][^'\"]*['\"]\s*,\s*['\"]?(\d+)['\"]?/i);
+      if (defUsersMatch) return Math.max(1, parseInt(defUsersMatch[1], 10) || 1);
+
+      const directMatch = sample.match(/(?:^|[^\w])(first|last)\s*\(\s*(\d+)\s*\)/i);
+      if (directMatch) return Math.max(1, parseInt(directMatch[2], 10) || 1);
+
+      if (/^\d+$/.test(sample)) return Math.max(1, parseInt(sample, 10) || 1);
+    }
+    return 0;
+  }
+
+  function sanitizeUserHistoryBriefHtml(html) {
+    const doc = new DOMParser().parseFromString(`<div id="ppUserHistoryBriefRoot">${html}</div>`, 'text/html');
+    const wrapper = doc.getElementById('ppUserHistoryBriefRoot') || doc.body;
+    wrapper.querySelectorAll('script').forEach((node) => node.remove());
+    wrapper.querySelectorAll('#notificationBar, #notifsound, #contentTemp').forEach((node) => node.remove());
+
+    const heading = wrapper.querySelector('.alert.alert-info h4');
+    if (heading) heading.textContent = String(heading.textContent || '').replace(/^\s*Username\s*:\s*/i, 'User: ').trim();
+
+    wrapper.querySelectorAll('table').forEach((table) => {
+      if (table.closest('.pp-tableWrap')) return;
+      const tableWrap = doc.createElement('div');
+      tableWrap.className = 'pp-tableWrap';
+      table.parentNode.insertBefore(tableWrap, table);
+      tableWrap.appendChild(table);
+    });
+
+    wrapper.querySelectorAll('[id]').forEach((node) => {
+      const originalId = String(node.getAttribute('id') || '').trim();
+      if (!originalId) return;
+      node.setAttribute('data-pp-history-original-id', originalId);
+      node.removeAttribute('id');
+    });
+
+    const filterSelect = wrapper.querySelector('[data-pp-history-original-id="viewHistory"]');
+    if (filterSelect) {
+      filterSelect.setAttribute('data-pp-user-history-filter', '1');
+      filterSelect.removeAttribute('onchange');
+    }
+
+    const betIdInput = wrapper.querySelector('[data-pp-history-original-id="betid"]');
+    if (betIdInput) {
+      betIdInput.setAttribute('data-pp-user-history-betid', '1');
+      betIdInput.removeAttribute('onchange');
+    }
+
+    const submitButton = wrapper.querySelector('[data-pp-history-original-id="betidButton"]');
+    if (submitButton) {
+      submitButton.setAttribute('type', 'button');
+      submitButton.setAttribute('data-pp-user-history-submit', '1');
+      submitButton.removeAttribute('onclick');
+    }
+
+    const resultsSlot = wrapper.querySelector('[data-pp-history-original-id="contentHistoryUser"]');
+    if (resultsSlot) {
+      resultsSlot.setAttribute('data-pp-user-history-results-slot', '1');
+      resultsSlot.innerHTML = '';
+    }
+
+    return String(wrapper.innerHTML || '').trim();
+  }
+
+  function sanitizeUserHistoryDetailHtml(html) {
+    const history = readUserHistoryState();
+    const doc = new DOMParser().parseFromString(`<div id="ppUserHistoryDetailRoot">${html}</div>`, 'text/html');
+    const wrapper = doc.getElementById('ppUserHistoryDetailRoot') || doc.body;
+    wrapper.querySelectorAll('script').forEach((node) => node.remove());
+    wrapper.querySelectorAll('#notificationBar, #notifsound, #contentTemp').forEach((node) => node.remove());
+
+    let currentPage = Math.max(1, parseInt(history.page, 10) || 1);
+
+    wrapper.querySelectorAll('li, a, button, [onclick]').forEach((node) => {
+      const page = extractUserHistoryPageFromNode(node);
+      if (page > 0) {
+        node.setAttribute('data-pp-user-history-page', String(page));
+        node.removeAttribute('onclick');
+        if (node.tagName && node.tagName.toLowerCase() === 'a') node.setAttribute('href', '#');
+        const li = node.closest && node.closest('li');
+        if (li && /\bactive\b/i.test(li.className || '')) currentPage = page;
+      }
+    });
+
+    const activeText = wrapper.querySelector('.pagination .active a, .pagination .active span, ul.pagination .active a, ul.pagination .active span');
+    if (activeText) {
+      const activePage = parseInt(String(activeText.textContent || '').trim(), 10);
+      if (Number.isFinite(activePage) && activePage > 0) currentPage = activePage;
+    }
+
+    wrapper.querySelectorAll('[id]').forEach((node) => {
+      const originalId = String(node.getAttribute('id') || '').trim();
+      if (!originalId) return;
+      node.setAttribute('data-pp-history-original-id', originalId);
+      node.removeAttribute('id');
+    });
+
+    wrapper.querySelectorAll("button[onclick*='getGamesHistory'], button[onclick*='openImg('], button[onclick*='downloadInvoice(']").forEach((button) => {
+      normalizeActionIconButton(button);
+    });
+
+    wrapper.querySelectorAll('button[onclick*="switchMenu("], a[onclick*="switchMenu("]').forEach((node) => {
+      node.setAttribute('data-pp-history-close', '1');
+      node.removeAttribute('onclick');
+      if (node.tagName && node.tagName.toLowerCase() === 'a') node.setAttribute('href', '#');
+    });
+
+    return {
+      page: currentPage,
+      html: String(wrapper.innerHTML || '').trim() || '<div class="pp-userHistoryEmpty">History user kosong.</div>'
+    };
+  }
+
+  function renderUserHistoryComposite() {
+    const history = readUserHistoryState();
+    const primaryHtml = String(history.briefRenderedHtml || '').trim();
+    const detailHtml = String(history.detailRenderedHtml || '').trim() || '<div class="pp-userHistoryEmpty">History user kosong.</div>';
+
+    if (primaryHtml) {
+      const doc = new DOMParser().parseFromString(`<div id="ppUserHistoryCompositeRoot">${primaryHtml}</div>`, 'text/html');
+      const wrapper = doc.getElementById('ppUserHistoryCompositeRoot') || doc.body;
+      const slot = wrapper.querySelector('[data-pp-user-history-results-slot]');
+      if (slot) slot.remove();
+      const primaryContent = String(wrapper.innerHTML || '').trim();
+      return `<div class="pp-userHistoryBodyInner"><div class="pp-userHistorySurface"><div class="pp-userHistoryContent"><div class="pp-userHistoryViewport"><div class="pp-userHistoryPrimary">${primaryContent}</div><div class="pp-userHistorySecondary">${detailHtml}</div></div></div></div></div>`;
+    }
+
+    return `<div class="pp-userHistoryBodyInner"><div class="pp-userHistorySurface"><div class="pp-userHistoryContent"><div class="pp-userHistoryViewport"><div class="pp-userHistorySecondary">${detailHtml}</div></div></div></div></div>`;
+  }
+
+  async function fetchUserHistoryBriefHtml(options = {}, signal) {
+    const history = readUserHistoryState();
+    const request = createFetchSignal(signal, 15000);
+    const body = new URLSearchParams();
+    body.append('username', String(options.username || history.username || ''));
+    body.append('fpage', String(options.fpage || history.fpage || 'depo'));
+
+    try {
+      const response = await fetch(USER_BRIEF_ENDPOINT, {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        signal: request.signal,
+        headers: getPanelAjaxHeaders({
+          accept: '*/*',
+          'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'x-requested-with': 'XMLHttpRequest'
+        }),
+        body: body.toString()
+      });
+
+      if (!response.ok) throw new Error(`User history brief request failed: ${response.status}`);
+      return response.text();
+    } finally {
+      request.cleanup();
+    }
+  }
+
+  async function fetchUserHistoryHtml(options = {}, signal) {
+    const history = readUserHistoryState();
+    const request = createFetchSignal(signal, 15000);
+    const body = new URLSearchParams();
+    body.append('username', String(options.username || history.username || ''));
+    body.append('fpage', String(options.fpage || history.fpage || 'depo'));
+    body.append('filter', String(options.filter || history.filter || 'all'));
+    body.append('page', String(Math.max(1, parseInt(options.page, 10) || history.page || 1)));
+    body.append('source', String(options.source || history.source || 'deposit'));
+    const betId = String(options.betId != null ? options.betId : history.betId || '').trim();
+    if (betId) body.append('betid', betId);
+
+    try {
+      const response = await fetch(USER_HISTORY_ENDPOINT, {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        signal: request.signal,
+        headers: getPanelAjaxHeaders({
+          accept: '*/*',
+          'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'x-requested-with': 'XMLHttpRequest'
+        }),
+        body: body.toString()
+      });
+
+      if (!response.ok) throw new Error(`User history request failed: ${response.status}`);
+      return response.text();
+    } finally {
+      request.cleanup();
+    }
+  }
+
+  async function loadUserHistory(options = {}) {
+    if (!isPanelAlive() || !isAuthenticated()) return false;
+    markInteracting(1200);
+    ensureUserHistoryLayer();
+    const history = readUserHistoryState();
+
+    const nextUsername = String(options.username || history.username || '').trim();
+    const nextMeta = getHistoryKindMeta(options.fpage || history.fpage || (String(options.source || history.source).toLowerCase() === 'withdraw' ? 'wd' : 'depo'));
+    const nextFpage = nextMeta.fpage;
+    const nextSource = String(options.source || history.source || nextMeta.source).toLowerCase() === 'withdraw' ? 'withdraw' : nextMeta.source;
+    const identityChanged = nextUsername !== history.username || nextFpage !== history.fpage || nextSource !== history.source;
+
+    history.username = nextUsername;
+    history.fpage = nextFpage;
+    history.source = nextSource;
+    history.label = nextMeta.label;
+    history.filter = String(options.filter != null ? options.filter : history.filter || 'all') || 'all';
+    history.betId = String(options.betId != null ? options.betId : history.betId || '').trim();
+    history.page = Math.max(1, parseInt(options.page, 10) || history.page || 1);
+    history.open = true;
+    syncUserHistoryMeta();
+    refs.historyLayer.classList.add('is-open');
+
+    if (history.abortController) {
+      try { history.abortController.abort(); } catch (_) {}
+    }
+
+    const controller = new AbortController();
+    history.abortController = controller;
+    history.loading = true;
+    const shouldRefreshBrief = options.refreshBrief === true || identityChanged || !history.briefRenderedHtml;
+
+    if (refs.historyLayer) refs.historyLayer.classList.add('is-loading');
+    if (refs.historyBody && (!history.renderedHtml || shouldRefreshBrief || options.forceBusy === true)) {
+      refs.historyBody.innerHTML = `<div class="pp-userHistoryBodyInner"><div class="pp-userHistorySurface"><div class="pp-loading">${renderSearchLoadingContent(`Loading ${history.label.toLowerCase()} history...`)}</div></div></div>`;
+    }
+
+    try {
+      const tasks = [
+        shouldRefreshBrief ? fetchUserHistoryBriefHtml(history, controller.signal) : Promise.resolve(null),
+        fetchUserHistoryHtml(history, controller.signal)
+      ];
+      const [briefHtml, detailHtml] = await Promise.all(tasks);
+      if (history.abortController !== controller) return false;
+
+      if (briefHtml != null) {
+        history.briefHtml = String(briefHtml || '');
+        history.briefRenderedHtml = sanitizeUserHistoryBriefHtml(history.briefHtml);
+      }
+
+      history.detailHtml = String(detailHtml || '');
+      const renderedDetail = sanitizeUserHistoryDetailHtml(history.detailHtml);
+      history.page = Math.max(1, parseInt(renderedDetail.page, 10) || history.page || 1);
+      history.detailRenderedHtml = renderedDetail.html;
+      history.html = history.detailHtml;
+      history.renderedHtml = renderUserHistoryComposite();
+      if (refs.historyBody) refs.historyBody.innerHTML = history.renderedHtml;
+
+      const filterSelect = refs.historyBody && refs.historyBody.querySelector('[data-pp-user-history-filter]');
+      if (filterSelect) filterSelect.value = history.filter || 'all';
+      const betIdInput = refs.historyBody && refs.historyBody.querySelector('[data-pp-user-history-betid]');
+      if (betIdInput) betIdInput.value = history.betId || '';
+
+      syncUserHistoryMeta();
+      return true;
+    } catch (error) {
+      if (error && error.name === 'AbortError') return false;
+      console.error(`[${PANEL_ID}] user history load failed`, error);
+      history.renderedHtml = '<div class="pp-userHistoryBodyInner"><div class="pp-userHistorySurface"><div class="pp-userHistoryError">Gagal memuat history user.</div></div></div>';
+      if (refs.historyBody) refs.historyBody.innerHTML = history.renderedHtml;
+      showPanelToast('Gagal memuat history user.', 'warn', 1700);
+      return false;
+    } finally {
+      if (refs.historyLayer) refs.historyLayer.classList.remove('is-loading');
+      if (history.abortController === controller) history.abortController = null;
+      history.loading = false;
+    }
+  }
+
+  function openUserHistory(options = {}) {
+    const username = String(options.username || '').trim();
+    if (!username) return;
+    const meta = getHistoryKindMeta(options.fpage || options.type);
+    loadUserHistory({
+      username,
+      fpage: meta.fpage,
+      source: options.source || meta.source,
+      filter: options.filter || 'all',
+      betId: options.betId || '',
+      page: Math.max(1, parseInt(options.page, 10) || 1),
+      refreshBrief: true,
+      forceBusy: true
+    }).catch(() => {});
+  }
+
+  function installUserHistoryGlobalBridge() {
+    const globalObj = typeof window !== 'undefined' ? window : globalThis;
+    globalObj.showHistoryDepo = function(username, fpage) {
+      openUserHistory({ username, fpage: fpage || 'depo', source: 'deposit' });
+      return false;
+    };
+    globalObj.showHistoryWD = function(username, fpage) {
+      openUserHistory({ username, fpage: fpage || 'wd', source: 'withdraw' });
+      return false;
+    };
+    globalObj.showHistoryUser = function(username, page, fpage) {
+      const history = readUserHistoryState();
+      const body = refs && refs.historyBody ? refs.historyBody : null;
+      const filterSelect = body && body.querySelector('[data-pp-user-history-filter]');
+      const betIdInput = body && body.querySelector('[data-pp-user-history-betid]');
+      loadUserHistory({
+        username: username || history.username || '',
+        fpage: fpage || history.fpage || 'depo',
+        source: String((fpage || history.fpage || 'depo')).toLowerCase() === 'wd' ? 'withdraw' : 'deposit',
+        filter: String(filterSelect && filterSelect.value || history.filter || 'all'),
+        betId: String(betIdInput && betIdInput.value || history.betId || ''),
+        page: Math.max(1, parseInt(page, 10) || 1),
+        refreshBrief: false,
+        forceBusy: false
+      }).catch(() => {});
+      return false;
+    };
+    globalObj.showHistoryDefUsers = function(username, fpage, filter, page, source) {
+      loadUserHistory({
+        username,
+        fpage: fpage || ((String(source || '').toLowerCase() === 'withdraw' || String(source || '').toLowerCase() === 'wd') ? 'wd' : 'depo'),
+        filter: filter || 'all',
+        page: Math.max(1, parseInt(page, 10) || 1),
+        source: source || ((String(fpage || '').toLowerCase() === 'wd') ? 'withdraw' : 'deposit'),
+        refreshBrief: false,
+        forceBusy: false
+      }).catch(() => {});
+      return false;
+    };
+    globalObj.searchBet = function() {
+      applyUserHistoryLocalFilters();
+      return false;
+    };
+  }
+
+  function bindUserHistoryTriggers(type, tab) {
+    if (!tab || tab.__ppUserHistoryTriggersBound) return;
+    tab.__ppUserHistoryTriggersBound = true;
+    tab.addEventListener('click', (event) => {
+      const trigger = event.target.closest('[data-pp-history-username]');
+      if (!trigger || !tab.contains(trigger)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      markInteracting(240);
+      openUserHistory({
+        username: trigger.dataset.ppHistoryUsername || '',
+        fpage: trigger.dataset.ppHistoryFpage || (type === 'wd' ? 'wd' : 'depo'),
+        source: trigger.dataset.ppHistorySource || (type === 'wd' ? 'withdraw' : 'deposit')
+      });
+    });
   }
 
   function extractDepositBankCounts(html, rows) {
@@ -3738,6 +5587,63 @@ function normalizeBankLabelKey(value) {
     return counts;
   }
 
+  function buildPendingEmptyTable(type) {
+    if (type === "depo") {
+      return `
+        <div class="well well-sm" style="margin-bottom:12px;">
+          <table class="table table-stripped bg-transparent" style="margin-bottom:0;">
+            <thead>
+              <tr class="fw-bold">
+                <th></th>
+                <th>No.</th>
+                <th>Tanggal</th>
+                <th>Username</th>
+                <th>Bank Asal</th>
+                <th>Bank Tujuan</th>
+                <th style="width:180px;border-top:none">Bonus</th>
+                <th style="width:150px;border-top:none">Jumlah</th>
+                <th style="width:120px;border-top:none">Note</th>
+                <th style="width:112px;border-top:none">Approval</th>
+                <th style="width:92px;border-top:none">Action</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>`;
+    }
+    return `
+      <div class="alert alert-danger" style="margin-bottom:12px;border-radius:4px;border-color:#eed3d7;padding:9px 15px 8px;">
+        <table class="table table-hover" style="border-color:#cbcbcb;margin-bottom:0;">
+          <thead>
+            <tr class="fw-bold">
+              <th></th>
+              <th style="border-top:none;">No</th>
+              <th style="width:130px;border-top:none;">Tanggal</th>
+              <th style="width:150px;border-top:none;">Username</th>
+              <th style="border-top:none;">Bank Tujuan</th>
+              <th style="border-top:none;">Bank Asal Transfer</th>
+              <th style="width:150px;border-top:none;">Bonus</th>
+              <th style="width:110px;border-top:none;">Jumlah</th>
+              <th style="width:125px;border-top:none;">Note</th>
+              <th style="width:112px;border-top:none;">Auto WD</th>
+              <th style="width:92px;border-top:none;">Action</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>`;
+  }
+
+  function buildPendingBodyMarkup(type, parsed) {
+    const tableHtml = String(parsed && parsed.tableHtml || "").trim();
+    const actionHtml = String(parsed && parsed.actionHtml || "").trim();
+    const hasTable = /<table\b/i.test(tableHtml);
+    const tableBlock = hasTable
+      ? `<div class="pp-tableWrap${parsed.visibleTotal ? "" : " pp-tableWrapEmpty"}">${tableHtml}</div>`
+      : buildPendingEmptyTable(type);
+    return `${actionHtml ? `<div class="pp-actionWrap">${actionHtml}</div>` : ""}${tableBlock}`;
+  }
+
   function buildSectionMarkup(type, parsed) {
     const cfg = state[type];
     const banks = getAvailableBanks(type, { rowBanks: parsed.availableBanks || [] });
@@ -3752,9 +5658,7 @@ function normalizeBankLabelKey(value) {
     const bankLabel = !cfg.hasBankSelection || selectedCount === totalBanks
       ? `All selected (${totalBanks})`
       : `${selectedCount} selected`;
-    const bodyHtml = parsed.visibleTotal
-      ? `${parsed.actionHtml ? `<div class="pp-actionWrap">${parsed.actionHtml}</div>` : ""}<div class="pp-tableWrap">${parsed.tableHtml}</div>`
-      : `<div class="pp-empty">${cfg.hasBankSelection ? `Tidak ada pending ${isDeposit ? "deposit" : "withdraw"} pada filter bank` : `Tidak ada pending ${isDeposit ? "deposit" : "withdraw"}`}</div>`;
+    const bodyHtml = buildPendingBodyMarkup(type, parsed);
     const approvedHistoryHtml = isDeposit ? buildDepositApprovedMarkup() : buildWithdrawApprovedMarkup();
 
     return `
@@ -3828,8 +5732,9 @@ function normalizeBankLabelKey(value) {
     if (sortSelect) {
       sortSelect.value = cfg.sortBy;
       sortSelect.addEventListener("change", () => {
+        markInteracting(720);
         cfg.sortBy = sortSelect.value;
-        loadSection(type);
+        if (!rerenderSectionFromCache(type)) loadSection(type);
       });
     }
 
@@ -3837,8 +5742,9 @@ function normalizeBankLabelKey(value) {
     if (showAllInput) {
       showAllInput.checked = !!cfg.showAll;
       showAllInput.addEventListener("change", () => {
+        markInteracting(720);
         cfg.showAll = !!showAllInput.checked;
-        loadSection(type);
+        if (!rerenderSectionFromCache(type)) loadSection(type);
       });
     }
 
@@ -3910,8 +5816,9 @@ function normalizeBankLabelKey(value) {
       if (limitSelect) {
         limitSelect.value = cfg.showWDLimit;
         limitSelect.addEventListener("change", () => {
+          markInteracting(720);
           cfg.showWDLimit = limitSelect.value;
-          loadSection(type);
+          if (!rerenderSectionFromCache(type)) loadSection(type);
         });
       }
     }
@@ -3919,6 +5826,7 @@ function normalizeBankLabelKey(value) {
     const refreshBtn = tab.querySelector(isDeposit ? "#ppDepoRefresh" : "#ppWdRefresh");
     if (refreshBtn) {
       refreshBtn.addEventListener("click", () => {
+        markInteracting(640);
         if (state.loading[type]) {
           state.pendingReload[type] = true;
           return;
@@ -3944,6 +5852,8 @@ function normalizeBankLabelKey(value) {
     bindBankMenu(type, tab);
     bindScopedBulkActions(type, tab);
     bindScopedHelpers(type, tab);
+    bindPendingFastCopyDelegation(type, tab);
+    bindUserHistoryTriggers(type, tab);
     applyDynamicValues(type, tab);
   }
 
@@ -3971,6 +5881,7 @@ function normalizeBankLabelKey(value) {
     state.menuCloseFns[type] = closeMenu;
 
     toggle.addEventListener("click", (event) => {
+      markInteracting(920);
       event.stopPropagation();
       const willOpen = !menu.classList.contains("is-open");
       menu.classList.toggle("is-open", willOpen);
@@ -3984,21 +5895,24 @@ function normalizeBankLabelKey(value) {
       const action = button.dataset.bankAction;
       const boxes = [...menu.querySelectorAll("input[type='checkbox']")];
       if (action === "all") {
+        markInteracting(720);
         boxes.forEach((box) => { box.checked = true; });
         return;
       }
       if (action === "none") {
+        markInteracting(720);
         boxes.forEach((box) => { box.checked = false; });
         return;
       }
       if (action === "apply") {
+        markInteracting(960);
         const selected = boxes.filter((box) => box.checked).map((box) => box.value);
         const allValues = boxes.map((box) => box.value).filter(Boolean);
         cfg.hasBankSelection = selected.length !== allValues.length;
         cfg.banks = selected;
         menu.classList.remove("is-open");
         document.removeEventListener("mousedown", closeMenu, true);
-        loadSection(type, { busyText: "Filtering...", silent: true });
+        if (!rerenderSectionFromCache(type)) loadSection(type, { busyText: "Filtering...", silent: true });
       }
     });
 
@@ -4293,11 +6207,12 @@ function bindDepositAutoApproveLockMenu(tab) {
     }
 
     tab.querySelectorAll("input[readonly]").forEach((input) => {
-      const className = input.className || "";
-      if (/\bjumlah\b/.test(className) || /\bribuan\b/.test(className) || /click to copy/i.test(input.getAttribute("title") || "")) {
-        input.classList.add("pp-copyable");
-        input.addEventListener("click", () => copyReadonlyValue(input));
-      }
+      const kind = detectReadonlyCopyKind(input);
+      if (!kind) return;
+      input.dataset.ppFastCopy = kind;
+      input.classList.add("pp-copyable");
+      if (!input.getAttribute("aria-label")) input.setAttribute("aria-label", `Klik untuk copy ${kind}`);
+      ensureReadonlyQuickCopyBinding(input);
     });
 
     tab.querySelectorAll("button[onclick]").forEach((button) => {
@@ -4631,6 +6546,427 @@ function bindDepositAutoApproveLockMenu(tab) {
     return showPanelToast("Mode Safe Withdraw Aktif.", "warn", 1700);
   }
 
+  function getSafeWithdrawCopyLabel(kind) {
+    const normalized = String(kind || "").trim().toLowerCase();
+    if (normalized === "nominal") return "Nominal";
+    if (normalized === "nama rekening") return "nama rekening";
+    return "nomor rekening";
+  }
+
+  function getFastCopyBufferNode() {
+    const copyState = state.copy || (state.copy = { lastKey: "", lastAt: 0, pendingKey: "", pendingAt: 0, lastToastKey: "", lastToastAt: 0, buffer: null, inflightKey: "", inflightPromise: null });
+    if (copyState.buffer && document.body.contains(copyState.buffer)) return copyState.buffer;
+    try {
+      const ta = document.createElement('textarea');
+      ta.setAttribute('readonly', 'readonly');
+      ta.setAttribute('aria-hidden', 'true');
+      ta.tabIndex = -1;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      ta.style.pointerEvents = 'none';
+      ta.style.contain = 'strict';
+      ta.style.inset = '0 auto auto -9999px';
+      ta.style.width = '1px';
+      ta.style.height = '1px';
+      ta.style.padding = '0';
+      ta.style.border = '0';
+      ta.style.outline = '0';
+      ta.style.boxShadow = 'none';
+      ta.style.background = 'transparent';
+      document.body.appendChild(ta);
+      copyState.buffer = ta;
+      return ta;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function fastExecCopyText(text) {
+    const value = String(text || '').replace(/\r/g, '').trim();
+    if (!value) return false;
+    try {
+      const ta = getFastCopyBufferNode();
+      if (!ta) return false;
+      ta.value = value;
+      ta.focus({ preventScroll: true });
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      ta.blur();
+      return !!ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function copyPlainTextSafe(text) {
+    const value = String(text || '').replace(/\r/g, '').trim();
+    if (!value) return false;
+    try {
+      const globalFn = typeof window !== 'undefined' && window && typeof window.copyPlainText === 'function' ? window.copyPlainText : null;
+      if (globalFn && globalFn !== copyPlainTextSafe) {
+        const ok = await globalFn(value);
+        if (ok) return true;
+      }
+    } catch (_) {}
+    const fastOk = fastExecCopyText(value);
+    if (fastOk) {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          Promise.resolve(navigator.clipboard.writeText(value)).catch(() => {});
+        }
+      } catch (_) {}
+      return true;
+    }
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+
+  try {
+    if (typeof window !== 'undefined' && window) {
+      if (typeof window.copyPlainText !== 'function') window.copyPlainText = copyPlainTextSafe;
+      window.copyPlainTextSafe = copyPlainTextSafe;
+      window.__ppCopyPlainTextSafe = copyPlainTextSafe;
+    }
+  } catch (_) {}
+
+
+  function getCopyPlainTextHelper() {
+    try {
+      if (typeof copyPlainTextSafe === 'function') return copyPlainTextSafe;
+    } catch (_) {}
+    try {
+      if (typeof window !== 'undefined' && window) {
+        if (typeof window.copyPlainTextSafe === 'function') return window.copyPlainTextSafe;
+        if (typeof window.__ppCopyPlainTextSafe === 'function') return window.__ppCopyPlainTextSafe;
+        if (typeof window.copyPlainText === 'function') return window.copyPlainText;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function isLikelyAccountNameValue(value) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!text) return false;
+    if (text.length < 3 || text.length > 80) return false;
+    if (/^\+?\d{6,24}$/.test(text.replace(/\s+/g, ''))) return false;
+    if (/^\(?-?\d[\d.,]*\)?$/.test(text)) return false;
+    if (!/[A-Za-z]/.test(text)) return false;
+    if (/approve|reject|delete|loading|pending|deposit|withdraw|bonus|refresh|copy|klik|search|logout|clock/i.test(text)) return false;
+    if (/(?:bca|bni|bri|bsi|cimb|mandiri|seabank|danamon|jenius|dana|ovo|gopay|linkaja|telkomsel|axiata|antarbank)/i.test(text)) return false;
+    if (/\d{3,}/.test(text)) return false;
+    const compact = text.replace(/[^A-Za-z]/g, '');
+    if (compact.length < 3) return false;
+    return /^[A-Za-z][A-Za-z .'-]{1,78}$/.test(text);
+  }
+
+  function getReadonlyCopyNodeText(node) {
+    return String(node && (node.value != null ? node.value : node.textContent) || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function getReadonlyCopyContext(input) {
+    if (!input) return '';
+    const parts = [
+      input.getAttribute && input.getAttribute('title') || '',
+      input.getAttribute && input.getAttribute('aria-label') || '',
+      input.getAttribute && input.getAttribute('placeholder') || '',
+      input.getAttribute && input.getAttribute('name') || '',
+      input.getAttribute && input.getAttribute('id') || '',
+      input.className || '',
+      input.dataset ? Object.values(input.dataset || {}).join(' ') : '',
+      getReadonlyCopyNodeText(input.previousElementSibling),
+      getReadonlyCopyNodeText(input.parentElement),
+      getReadonlyCopyNodeText(input.closest && input.closest('label')),
+      getReadonlyCopyNodeText(input.closest && input.closest('.row')),
+      getReadonlyCopyNodeText(input.closest && input.closest('td'))
+    ];
+    return parts.join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function getFastCopyState() {
+    if (!state.copy) state.copy = { lastKey: '', lastAt: 0, pendingKey: '', pendingAt: 0, lastToastKey: '', lastToastAt: 0, buffer: null, inflightKey: '', inflightPromise: null };
+    if (!('inflightKey' in state.copy)) state.copy.inflightKey = '';
+    if (!('inflightPromise' in state.copy)) state.copy.inflightPromise = null;
+    return state.copy;
+  }
+
+  function buildFastCopyKey(input, kind, value) {
+    const rowId = input && input.closest ? String((input.closest('tr[id]') || {}).id || '') : '';
+    const inputKey = input ? String(input.name || input.id || input.className || input.type || 'input') : 'input';
+    return [String(kind || '').trim().toLowerCase(), rowId, inputKey, String(value || '')].join('|');
+  }
+
+  function shouldSkipFastCopy(key, holdMs = 140) {
+    const copyState = getFastCopyState();
+    const now = Date.now();
+    if (copyState.pendingKey && copyState.pendingKey === key && now - Number(copyState.pendingAt || 0) < 820) return true;
+    if (copyState.lastKey && copyState.lastKey === key && now - Number(copyState.lastAt || 0) < holdMs) return true;
+    return false;
+  }
+
+  function notifyFastCopyResult(kind, ok) {
+    const copyState = getFastCopyState();
+    const mode = ok ? 'success' : 'warn';
+    const label = getSafeWithdrawCopyLabel(kind);
+    const toastKey = `${String(kind || '').trim().toLowerCase()}|${ok ? '1' : '0'}`;
+    const now = Date.now();
+    if (copyState.lastToastKey === toastKey && now - Number(copyState.lastToastAt || 0) < 500) return;
+    copyState.lastToastKey = toastKey;
+    copyState.lastToastAt = now;
+    showPanelToast(ok ? `Copy ${label} berhasil` : `Copy ${label} gagal`, mode, 1350);
+  }
+
+  async function performFastCopyValue(input, kind, value) {
+    const normalizedKind = String(kind || '').trim().toLowerCase();
+    const copyValue = String(value || '').trim();
+    if (!normalizedKind || !copyValue) {
+      notifyFastCopyResult(normalizedKind || kind, false);
+      return false;
+    }
+    const key = buildFastCopyKey(input, normalizedKind, copyValue);
+    const copyState = getFastCopyState();
+    if (copyState.inflightKey === key && copyState.inflightPromise) {
+      return copyState.inflightPromise;
+    }
+    if (shouldSkipFastCopy(key)) return true;
+    copyState.pendingKey = key;
+    copyState.pendingAt = Date.now();
+    const runner = (async () => {
+      let ok = false;
+      try {
+        ok = fastExecCopyText(copyValue);
+        if (!ok) ok = await copyPlainTextSafe(copyValue);
+      } catch (_) {
+        ok = false;
+      }
+      if (copyState.pendingKey === key) {
+        copyState.pendingKey = '';
+        copyState.pendingAt = 0;
+      }
+      if (ok) {
+        copyState.lastKey = key;
+        copyState.lastAt = Date.now();
+        try { input && input.focus && input.focus({ preventScroll: true }); } catch (_) {}
+        try { input && input.select && input.select(); } catch (_) {}
+      }
+      notifyFastCopyResult(normalizedKind, ok);
+      return ok;
+    })();
+    copyState.inflightKey = key;
+    copyState.inflightPromise = runner;
+    try {
+      return await runner;
+    } finally {
+      if (copyState.inflightKey === key) {
+        copyState.inflightKey = '';
+        copyState.inflightPromise = null;
+      }
+    }
+  }
+
+  function normalizeSafeWithdrawCopyValue(input, kind) {
+    const raw = String(input && input.value != null ? input.value : "").trim();
+    if (!raw) return "";
+    const normalizedKind = String(kind || '').trim().toLowerCase();
+    if (normalizedKind === "nominal") return raw.replace(/,/g, "").replace(/\s+/g, "").trim();
+    if (normalizedKind === "nama rekening") return raw.replace(/\s+/g, ' ').trim();
+    return raw.replace(/\s+/g, "").trim();
+  }
+
+
+  function inferPendingCopyKindFromInput(input) {
+    if (!input) return '';
+    const className = String(input.className || '').toLowerCase();
+    const nameAttr = String(input.name || '').toLowerCase();
+    const idAttr = String(input.id || '').toLowerCase();
+    const valueRaw = String(input.value || input.textContent || '').replace(/\s+/g, ' ').trim();
+    const valueCompact = valueRaw.replace(/\s+/g, '');
+    const context = getReadonlyCopyContext(input);
+    const keyText = `${className} ${nameAttr} ${idAttr} ${context}`;
+    if (!valueRaw) return '';
+    if (/approval|approve|note|bonus|event|search|filter|sort|username|userid|login|captcha/i.test(keyText)) return '';
+    if (/(nominal|jumlah|ribuan|amount)/i.test(keyText)) return 'nominal';
+    if (/(rekening|norek|account\s*number|deporek|wdrek)/i.test(keyText)) return 'nomor rekening';
+    if (/(nama\s*rekening|atas\s*nama|holder|account\s*name|name)/i.test(keyText) && isLikelyAccountNameValue(valueRaw)) return 'nama rekening';
+    if (/^\+?\d{8,24}$/.test(valueCompact)) return 'nomor rekening';
+    if (isLikelyAccountNameValue(valueRaw)) return 'nama rekening';
+    return '';
+  }
+
+  function detectReadonlyCopyKind(input) {
+    if (!input) return '';
+    const datasetKind = String(input.dataset && (input.dataset.ppSafeCopy || input.dataset.ppFastCopy) || '').trim().toLowerCase();
+    if (datasetKind) return datasetKind;
+    return inferPendingCopyKindFromInput(input);
+  }
+
+
+  async function handleSafeWithdrawCopyTrigger(input, explicitKind = "") {
+    if (!input) return false;
+    const kind = String(explicitKind || detectReadonlyCopyKind(input) || "").trim().toLowerCase();
+    if (!kind) return false;
+    const row = input.closest && input.closest('tr[id^="withdrawPending-"]');
+    if (row && row.dataset.ppWdQueueLocked === '1') {
+      showSafeWithdrawNativeAlert();
+      return false;
+    }
+    const value = normalizeSafeWithdrawCopyValue(input, kind);
+    return performFastCopyValue(input, kind, value);
+  }
+
+
+  function ensureSafeWithdrawCopyBinding(input, kind) {
+    if (!input || input.__ppSafeCopyBound) return;
+    const trigger = async (event, mode = 'click') => {
+      if (!state.wd.queueMode) return;
+      if (mode === 'click' && Date.now() - Number(input.__ppSafeCopyPointerAt || 0) < 260) {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      if (mode === 'pointerdown') input.__ppSafeCopyPointerAt = Date.now();
+      await handleSafeWithdrawCopyTrigger(input, kind);
+    };
+    input.__ppSafeCopyBound = true;
+    input.__ppSafeCopyHandler = trigger;
+    input.addEventListener('pointerdown', (event) => trigger(event, 'pointerdown'), true);
+    input.addEventListener('click', (event) => trigger(event, 'click'), true);
+    input.addEventListener('keydown', (event) => {
+      if (!state.wd.queueMode) return;
+      if (!event) return;
+      if (event.key === 'Enter' || event.key === ' ') {
+        trigger(event, 'key');
+      }
+    }, true);
+  }
+
+  function ensureReadonlyQuickCopyBinding(input) {
+    if (!input || input.__ppReadonlyQuickCopyBound) return;
+    const trigger = async (event, mode = 'click') => {
+      const kind = detectReadonlyCopyKind(input);
+      if (!kind) return;
+      if (mode === 'click' && Date.now() - Number(input.__ppReadonlyCopyPointerAt || 0) < 260) {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      if (mode === 'pointerdown') input.__ppReadonlyCopyPointerAt = Date.now();
+      await copyReadonlyValue(input);
+    };
+    input.__ppReadonlyQuickCopyBound = true;
+    input.addEventListener('pointerdown', (event) => trigger(event, 'pointerdown'), true);
+    input.addEventListener('click', (event) => trigger(event, 'click'), true);
+    input.addEventListener('keydown', (event) => {
+      if (!event) return;
+      if (event.key === 'Enter' || event.key === ' ') trigger(event, 'key');
+    }, true);
+  }
+
+
+  function bindPendingFastCopyDelegation(type, tab) {
+    if (!tab || tab.__ppPendingFastCopyDelegationBound) return;
+    tab.__ppPendingFastCopyDelegationBound = true;
+
+    const trigger = async (event, mode = 'click') => {
+      const target = event && event.target && event.target.closest ? event.target.closest('input, textarea') : null;
+      if (!target || target.disabled || target.readOnly === false && !target.classList.contains('deporekform') && !target.classList.contains('wdrekform')) return;
+      const row = target.closest && target.closest(type === 'wd' ? 'tr[id^="withdrawPending-"]' : 'tr[id^="depositPending-"]');
+      if (!row) return;
+      const kind = detectReadonlyCopyKind(target);
+      if (!kind) return;
+      const value = normalizeSafeWithdrawCopyValue(target, kind);
+      if (!value) return;
+      if (type === 'wd' && row.dataset && row.dataset.ppWdQueueLocked === '1') {
+        event.preventDefault();
+        event.stopPropagation();
+        showSafeWithdrawNativeAlert();
+        return;
+      }
+      if (mode === 'click' && Date.now() - Number(target.__ppPendingCopyPointerAt || 0) < 220) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (mode === 'pointerdown') target.__ppPendingCopyPointerAt = Date.now();
+      event.preventDefault();
+      event.stopPropagation();
+      await performFastCopyValue(target, kind, value);
+    };
+
+    tab.addEventListener('pointerdown', (event) => { trigger(event, 'pointerdown'); }, true);
+    tab.addEventListener('click', (event) => { trigger(event, 'click'); }, true);
+    tab.addEventListener('keydown', (event) => {
+      if (!event) return;
+      if (event.key === 'Enter' || event.key === ' ') trigger(event, 'key');
+    }, true);
+  }
+
+  function setSafeWithdrawCopyTarget(input, kind, enabled) {
+    if (!input) return;
+    if (enabled) {
+      input.dataset.ppSafeCopy = kind;
+      input.dataset.ppFastCopy = kind;
+      input.classList.add('pp-safeCopyable');
+      input.classList.add('pp-copyable');
+      input.style.cursor = 'default';
+      input.setAttribute('title', kind === 'nominal' ? 'Klik untuk copy nominal' : 'Klik untuk copy nomor rekening');
+      input.setAttribute('aria-label', kind === 'nominal' ? 'Klik untuk copy nominal' : 'Klik untuk copy nomor rekening');
+      ensureSafeWithdrawCopyBinding(input, kind);
+      return;
+    }
+    if (input.dataset.ppSafeCopy) delete input.dataset.ppSafeCopy;
+    if (input.dataset.ppFastCopy) delete input.dataset.ppFastCopy;
+    input.classList.remove('pp-safeCopyable');
+    const title = String(input.getAttribute('title') || '');
+    if (/Klik untuk copy (?:nominal|nomor rekening)/i.test(title)) input.removeAttribute('title');
+    const label = String(input.getAttribute('aria-label') || '');
+    if (/Klik untuk copy (?:nominal|nomor rekening)/i.test(label)) input.removeAttribute('aria-label');
+  }
+
+  function updateSafeWithdrawQuickCopyTargets(row, targets, enabled) {
+    if (!row || !targets) return;
+    setSafeWithdrawCopyTarget(targets.nomorInput, 'nomor rekening', !!enabled);
+    setSafeWithdrawCopyTarget(targets.jumlahInput, 'nominal', !!enabled);
+  }
+
+  function bindSafeWithdrawQuickCopy() {
+    const tab = refs.wdTab;
+    if (!tab || tab.__ppSafeWithdrawQuickCopyBound) return;
+    tab.__ppSafeWithdrawQuickCopyBound = true;
+    tab.addEventListener('click', async (event) => {
+      if (!state.wd.queueMode || !event || !event.target || !event.target.closest) return;
+      const input = event.target.closest('input[data-pp-safe-copy]');
+      if (!input) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const kind = String(input.dataset.ppSafeCopy || '').trim().toLowerCase();
+      await handleSafeWithdrawCopyTrigger(input, kind);
+    }, true);
+    state.cleanupFns.push(() => {
+      try { tab.__ppSafeWithdrawQuickCopyBound = false; } catch (_) {}
+    });
+  }
+
   function bindSafeWithdrawLockGuard() {
     const tab = refs.wdTab;
     if (!tab || tab.__ppSafeWithdrawLockGuardBound) return;
@@ -4677,6 +7013,7 @@ function bindDepositAutoApproveLockMenu(tab) {
       setWithdrawModeInputState(targets.nomorInput, hidden);
       setWithdrawModeAmountState(targets.jumlahInput, hidden);
       setWithdrawModeButtonState(targets.approveBtn, hidden);
+      updateSafeWithdrawQuickCopyTargets(row, targets, enabled && !hidden);
     });
   }
 
@@ -4715,25 +7052,17 @@ function bindDepositAutoApproveLockMenu(tab) {
   }
 
   async function copyReadonlyValue(input) {
-    const original = input.value;
-    const cleaned = original.replace(/,/g, "");
-    if (navigator.clipboard && window.isSecureContext) {
-      try {
-        await navigator.clipboard.writeText(cleaned);
-        return;
-      } catch (error) {
-        console.error(error);
-      }
+    if (!input) return false;
+    const kind = detectReadonlyCopyKind(input);
+    if (kind) {
+      const value = normalizeSafeWithdrawCopyValue(input, kind);
+      return performFastCopyValue(input, kind, value);
     }
-    input.value = cleaned;
-    input.select();
-    try {
-      document.execCommand("copy");
-    } catch (error) {
-      console.error(error);
-    }
-    input.value = original;
+    const original = String(input.value || "");
+    const cleaned = original.replace(/,/g, "").trim();
+    return performFastCopyValue(input, 'value', cleaned || original);
   }
+
 
   function updateBadges() {
     refs.depoBadge.textContent = String(state.depo.total || 0);
@@ -5081,11 +7410,18 @@ function getDepositExactAmountInput(row, id) {
     const baseFingerprint = state.fingerprints[type] || "";
     const baseSignature = state.signatures[type] || "";
     state.refreshRunId[type] = runId;
-    const delays = immediate ? [90, 340, 980] : [0];
+    const delays = immediate
+      ? (type === "wd" ? [70, 220, 520, 1200] : [40, 160, 420, 980])
+      : [0];
 
     delays.forEach((delay, index) => {
       const timer = window.setTimeout(async () => {
         if (state.refreshRunId[type] !== runId) return;
+        if (isInteractionLocked(type)) {
+          state.pendingReload[type] = true;
+          scheduleDeferredFlush(type);
+          return;
+        }
         const beforeFingerprint = state.fingerprints[type] || "";
         const beforeSignature = state.signatures[type] || "";
         await loadSection(type, { busyText: index === 0 ? "Updating..." : "Syncing...", silent: index > 0 });
@@ -5107,11 +7443,26 @@ function getDepositExactAmountInput(row, id) {
   function toggleMinimize(forceValue) {
     const next = typeof forceValue === "boolean" ? !!forceValue : !state.minimized;
     if (state.minimized === next) return state.minimized;
+    const now = Date.now();
+    if (now - Number(state.lastMinimizeToggleAt || 0) < 90) return state.minimized;
+    state.lastMinimizeToggleAt = now;
+    if (state.minimizeRaf) {
+      try { cancelAnimationFrame(state.minimizeRaf); } catch (_) {}
+      state.minimizeRaf = 0;
+    }
+    refs.panel.classList.add("pp-instantToggle");
     state.minimized = next;
     refs.panel.classList.toggle("is-minimized", state.minimized);
-    refs.minimizeBtn.title = state.minimized ? "Show content" : "Hide content";
-    refs.minimizeBtn.setAttribute("aria-label", state.minimized ? "Show content" : "Hide content");
+    if (refs.minimizeBtn) {
+      refs.minimizeBtn.title = state.minimized ? "Show content" : "Hide content";
+      refs.minimizeBtn.setAttribute("aria-label", state.minimized ? "Show content" : "Hide content");
+    }
     clampPanel();
+    state.minimizeRaf = window.requestAnimationFrame(() => {
+      clampPanel();
+      refs.panel.classList.remove("pp-instantToggle");
+      state.minimizeRaf = 0;
+    });
     if (!state.minimized && isAuthenticated()) {
       const activeType = state.activeTab;
       if (!state.loading[activeType] && Date.now() - (state.lastLoadedAt[activeType] || 0) > 1200) {
@@ -5135,6 +7486,12 @@ function getDepositExactAmountInput(row, id) {
       if (event.ctrlKey || event.altKey || event.metaKey) return;
       if (!isPanelAlive()) return;
       if (hasOpenPanelMenu()) return;
+      if (readUserHistoryState().open) {
+        event.preventDefault();
+        event.stopPropagation();
+        closeUserHistory();
+        return;
+      }
 
       const now = Date.now();
       if (now - (state.lastEscShortcutAt || 0) < 140) return;
@@ -5142,9 +7499,10 @@ function getDepositExactAmountInput(row, id) {
 
       event.preventDefault();
       event.stopPropagation();
-      markInteracting(220);
+      if (typeof event.stopImmediatePropagation === "function") event.stopImmediatePropagation();
+      markInteracting(90);
 
-      if (!isPanelAlive() || !refs.minimizeBtn) return;
+      if (!isPanelAlive()) return;
       toggleMinimize();
     };
 
@@ -5157,6 +7515,7 @@ function getDepositExactAmountInput(row, id) {
     if (state.drag) state.drag.bound = true;
     const start = (event) => {
       if (!event || (typeof event.button === "number" && event.button !== 0)) return;
+      if (!state.minimized) return;
       if (event.target.closest("button, input, select, textarea, label, a")) return;
       const rect = refs.panel.getBoundingClientRect();
       state.drag.active = true;
@@ -5165,7 +7524,7 @@ function getDepositExactAmountInput(row, id) {
       state.drag.startY = event.clientY;
       state.drag.left = rect.left;
       state.drag.top = rect.top;
-      refs.header.style.cursor = "grabbing";
+      refs.header.style.cursor = "default";
       refs.panel.style.transition = "none";
       try { refs.header.setPointerCapture(event.pointerId); } catch (_) {}
     };
@@ -5190,7 +7549,7 @@ function getDepositExactAmountInput(row, id) {
     const end = (event) => {
       if (!state.drag.active || event.pointerId !== state.drag.pointerId) return;
       state.drag.active = false;
-      refs.header.style.cursor = "grab";
+      refs.header.style.cursor = "default";
       refs.panel.style.transition = "";
       try { refs.header.releasePointerCapture(event.pointerId); } catch (error) {}
       clampPanel();
@@ -5205,34 +7564,23 @@ function getDepositExactAmountInput(row, id) {
   function clampPanel() {
     const metrics = getPanelViewportMetrics();
     const size = getPanelSizeFromViewport(metrics.vw, metrics.vh);
-    const centeredLeft = Math.max(metrics.gapX, Math.round((metrics.vw - size.width) / 2));
-    const maxLeft = Math.max(metrics.gapX, metrics.vw - size.width - metrics.gapX);
-    const maxTop = Math.max(metrics.gapY, metrics.vh - size.height - metrics.gapY);
-    const useManual = state.panelPosition && state.panelPosition.mode === "manual";
-    const left = useManual
-      ? Math.min(maxLeft, Math.max(metrics.gapX, Math.round(state.panelPosition.left || centeredLeft)))
-      : centeredLeft;
-    const top = useManual
-      ? Math.min(maxTop, Math.max(metrics.gapY, Math.round(state.panelPosition.top || metrics.gapY)))
-      : metrics.gapY;
 
     refs.panel.style.width = `${size.width}px`;
     refs.panel.style.maxWidth = `${size.maxWidth}px`;
     refs.panel.style.height = `${size.height}px`;
     refs.panel.style.maxHeight = `${size.maxHeight}px`;
-    refs.panel.style.left = `${left}px`;
-    refs.panel.style.top = `${top}px`;
+    refs.panel.style.left = "0px";
+    refs.panel.style.top = "0px";
     refs.panel.style.right = "auto";
+    refs.panel.style.bottom = "auto";
     refs.panel.style.transform = "none";
-    refs.panel.style.transformOrigin = "top center";
+    refs.panel.style.transformOrigin = "top left";
     refs.panel.style.setProperty("--pp-panel-gap-x", `${metrics.gapX}px`);
     refs.panel.style.setProperty("--pp-panel-gap-y", `${metrics.gapY}px`);
     refs.panel.style.setProperty("--pp-panel-zoom", String(metrics.zoom));
-
-    if (useManual) {
-      state.panelPosition.left = left;
-      state.panelPosition.top = top;
-    }
+    state.panelPosition.mode = "center";
+    state.panelPosition.left = 0;
+    state.panelPosition.top = 0;
   }
 
   function destroyPanel(reason) {
@@ -5240,6 +7588,10 @@ function getDepositExactAmountInput(row, id) {
     state.destroyed = true;
     clearApproveContextLocal();
     stopAutoSync();
+    if (state.viewportLock && typeof state.viewportLock.release === "function") {
+      try { state.viewportLock.release(); } catch (_) {}
+      state.viewportLock = null;
+    }
     clearDepositAutoApproveTimer();
     if (state.deferredFlushTimer) {
       clearTimeout(state.deferredFlushTimer);
@@ -5272,6 +7624,11 @@ function getDepositExactAmountInput(row, id) {
     }
     clearWithdrawApprovedRefreshTimer();
     clearWithdrawApprovedSyncTimers();
+    const historyController = state.history ? state.history.abortController : null;
+    if (historyController) {
+      try { historyController.abort(); } catch (error) {}
+      state.history.abortController = null;
+    }
     const approvedController = state.wd && state.wd.approved ? state.wd.approved.abortController : null;
     if (approvedController) {
       try { approvedController.abort(); } catch (error) {}
@@ -5352,6 +7709,394 @@ function getDepositExactAmountInput(row, id) {
       showAuthGate();
     }
   };
+
+  function ensureHeaderRefs() {
+    refs.tabsWrap = refs.tabsWrap || refs.panel.querySelector("#ppTabs");
+    refs.headerMeta = refs.headerMeta || refs.panel.querySelector("#ppHeaderMeta");
+    refs.headerUserWrap = refs.headerUserWrap || refs.panel.querySelector("#ppHeaderUserWrap");
+    refs.headerClockWrap = refs.headerClockWrap || refs.panel.querySelector("#ppHeaderClockWrap");
+    refs.tabs = [...refs.panel.querySelectorAll(".pp-tabButton[data-tab]")];
+    refs.depoBadge = refs.panel.querySelector("#ppDepoBadge") || refs.depoBadge;
+    refs.wdBadge = refs.panel.querySelector("#ppWdBadge") || refs.wdBadge;
+    return refs;
+  }
+
+  function getLivePanelTabButtons() {
+    ensureHeaderRefs();
+    refs.tabs = [...refs.panel.querySelectorAll(".pp-tabButton[data-tab]")];
+    return refs.tabs;
+  }
+
+  function parseSwitchMenuTarget(value) {
+    const raw = String(value || "");
+    if (!raw) return "";
+    const quoted = raw.match(/switchMenu\(\s*(['\"])([^'\"]+)\1\s*\)/i);
+    if (quoted && quoted[2]) return cleanHeaderText(quoted[2]);
+    const loose = raw.match(/switchMenu\(\s*([^\)]+)\s*\)/i);
+    if (loose && loose[1]) return cleanHeaderText(String(loose[1]).replace(/["'`;]/g, ""));
+    return "";
+  }
+
+  function getNativeActionTarget(node) {
+    if (!node || typeof node.getAttribute !== "function") return "";
+    return parseSwitchMenuTarget(node.getAttribute("href")) || parseSwitchMenuTarget(node.getAttribute("onclick"));
+  }
+
+  function findNativeHeaderActionNode(target, text = "") {
+    const nav = getNativeHeaderNavbar();
+    if (!nav) return null;
+    const nodes = [
+      ...nav.querySelectorAll('.navbar-brand, .navbar-nav .nav-item a, .navbar-nav .nav-item button, .navbar-nav .nav-item [role="button"]')
+    ];
+    const normalizedText = cleanHeaderText(text);
+    if (target) {
+      const direct = nodes.find((node) => getNativeActionTarget(node) === target);
+      if (direct) return direct;
+    }
+    if (normalizedText) {
+      const byText = nodes.find((node) => cleanHeaderText(node.textContent || "") === normalizedText);
+      if (byText) return byText;
+    }
+    return null;
+  }
+
+  function triggerNativeHeaderAction(target, text = "", fallback = null) {
+    const normalizedTarget = cleanHeaderText(target);
+    if (normalizedTarget && typeof window.switchMenu === "function") {
+      try {
+        window.switchMenu(normalizedTarget);
+        return true;
+      } catch (_) {}
+    }
+    const node = fallback || findNativeHeaderActionNode(normalizedTarget, text);
+    if (node) {
+      try {
+        node.click();
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function classifyHeaderNavItem(item) {
+    const target = cleanHeaderText(item && item.target);
+    const text = cleanHeaderText(item && item.text).toLowerCase();
+    if (target === 'menuDeposit' || /\bdeposit\b/.test(text)) return 'depo';
+    if (target === 'menuWithdraw' || /\bwithdraw\b/.test(text)) return 'wd';
+    if (target === 'menuAllUser' || /\busers?\b/.test(text)) return 'user';
+    return 'native';
+  }
+
+  function readNativePrimaryNavModel() {
+    const nav = getNativeHeaderNavbar();
+    const empty = { brandTarget: '', leftItems: [] };
+    if (!nav) return empty;
+    const brandNode = nav.querySelector('.navbar-brand');
+    const leftItems = [...nav.querySelectorAll('.navbar-nav:not(.ms-auto) > .nav-item')]
+      .map((item, index) => {
+        const actionNode = item.querySelector('a,button,[role="button"]') || item;
+        const text = cleanHeaderText(actionNode.textContent || item.textContent || '');
+        if (!text) return null;
+        const target = getNativeActionTarget(actionNode) || getNativeActionTarget(item);
+        return {
+          index,
+          text,
+          target,
+          kind: classifyHeaderNavItem({ text, target })
+        };
+      })
+      .filter(Boolean);
+    return {
+      brandTarget: getNativeActionTarget(brandNode),
+      leftItems
+    };
+  }
+
+  function renderHeaderNavFromNative(model = null, force = false) {
+    if (!isPanelAlive()) return false;
+    ensureHeaderRefs();
+    const wrap = refs.tabsWrap;
+    if (!wrap) return false;
+    model = model || readNativePrimaryNavModel();
+    const items = Array.isArray(model && model.leftItems) ? model.leftItems : [];
+    if (!items.length && !force) {
+      refs.tabs = getLivePanelTabButtons();
+      return false;
+    }
+
+    const signature = JSON.stringify(items.map((item) => [item.kind, item.target, item.text]));
+    if (!force && signature === String(state.headerNavSignature || '')) {
+      refs.tabs = getLivePanelTabButtons();
+      refs.depoBadge = wrap.querySelector('#ppDepoBadge') || refs.depoBadge;
+      refs.wdBadge = wrap.querySelector('#ppWdBadge') || refs.wdBadge;
+      return false;
+    }
+    state.headerNavSignature = signature;
+
+    const frag = document.createDocumentFragment();
+    items.forEach((item) => {
+      if (item.kind && state.headerTabText && Object.prototype.hasOwnProperty.call(state.headerTabText, item.kind)) {
+        state.headerTabText[item.kind] = item.text;
+      }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'pp-navItem';
+      btn.dataset.nativeNavText = item.text;
+      if (item.target) btn.dataset.nativeMenuTarget = item.target;
+
+      if (item.kind === 'depo' || item.kind === 'wd' || item.kind === 'user') {
+        btn.classList.add('pp-tabButton');
+        btn.dataset.tab = item.kind;
+        if (item.kind === state.activeTab) btn.classList.add('is-active');
+      } else {
+        btn.classList.add('pp-nativeNavButton');
+      }
+
+      const label = document.createElement('span');
+      label.className = 'pp-navLabel';
+      label.textContent = item.text;
+      btn.appendChild(label);
+
+      if (item.kind === 'depo' || item.kind === 'wd') {
+        const badge = document.createElement('span');
+        badge.className = `pp-badge ${item.kind === 'depo' ? 'pp-badgeGreen' : 'pp-badgeAmber'}`;
+        badge.id = item.kind === 'depo' ? 'ppDepoBadge' : 'ppWdBadge';
+        const currentBadge = item.kind === 'depo' ? refs.depoBadge : refs.wdBadge;
+        badge.textContent = cleanHeaderText(currentBadge && currentBadge.textContent) || '0';
+        btn.appendChild(document.createTextNode(' '));
+        btn.appendChild(badge);
+      }
+
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (item.kind === 'depo' || item.kind === 'wd') {
+          switchTab(item.kind);
+          return;
+        }
+        if (item.kind === 'user') {
+          if (typeof openUserTab === 'function') {
+            openUserTab();
+            return;
+          }
+        }
+        triggerNativeHeaderAction(item.target, item.text);
+      });
+
+      frag.appendChild(btn);
+    });
+
+    if (!items.length) {
+      const depoLabel = escapeHtml(String(cleanHeaderText(state.headerTabText && state.headerTabText.depo) || ''));
+      const wdLabel = escapeHtml(String(cleanHeaderText(state.headerTabText && state.headerTabText.wd) || ''));
+      wrap.innerHTML = `
+        <button type="button" class="pp-navItem pp-tabButton${state.activeTab === 'depo' ? ' is-active' : ''}" data-tab="depo"><span class="pp-navLabel">${depoLabel}</span> <span class="pp-badge pp-badgeGreen" id="ppDepoBadge">${escapeHtml(String(cleanHeaderText(refs.depoBadge && refs.depoBadge.textContent) || '0'))}</span></button>
+        <button type="button" class="pp-navItem pp-tabButton${state.activeTab === 'wd' ? ' is-active' : ''}" data-tab="wd"><span class="pp-navLabel">${wdLabel}</span> <span class="pp-badge pp-badgeAmber" id="ppWdBadge">${escapeHtml(String(cleanHeaderText(refs.wdBadge && refs.wdBadge.textContent) || '0'))}</span></button>
+      `;
+    } else {
+      wrap.replaceChildren(frag);
+    }
+
+    refs.tabs = getLivePanelTabButtons();
+    refs.depoBadge = wrap.querySelector('#ppDepoBadge') || refs.depoBadge;
+    refs.wdBadge = wrap.querySelector('#ppWdBadge') || refs.wdBadge;
+    if (refs.headerBrand) refs.headerBrand.dataset.nativeMenuTarget = cleanHeaderText(model.brandTarget);
+    return true;
+  }
+
+  function readNativeHeaderBoxSnapshot() {
+    const nav = getNativeHeaderNavbar();
+    if (!nav || typeof window.getComputedStyle !== 'function') return null;
+    const fluid = nav.querySelector('.container-fluid') || nav;
+    const navStyle = window.getComputedStyle(nav);
+    const fluidStyle = window.getComputedStyle(fluid);
+    const navRect = nav.getBoundingClientRect();
+    const fluidRect = fluid.getBoundingClientRect();
+    return {
+      backgroundColor: navStyle.backgroundColor || '',
+      backgroundImage: navStyle.backgroundImage || '',
+      borderBottomColor: navStyle.borderBottomColor || '',
+      minHeight: `${Math.max(44, Math.round(navRect.height || fluidRect.height || 50))}px`,
+      fluidMinHeight: `${Math.max(44, Math.round(fluidRect.height || navRect.height || 50))}px`,
+      paddingLeft: fluidStyle.paddingLeft || '',
+      paddingRight: fluidStyle.paddingRight || '',
+      paddingTop: fluidStyle.paddingTop || '',
+      paddingBottom: fluidStyle.paddingBottom || ''
+    };
+  }
+
+  function applyNativeHeaderBoxSnapshot(snapshot = null) {
+    if (!isPanelAlive()) return false;
+    snapshot = snapshot || readNativeHeaderBoxSnapshot();
+    if (!snapshot) return false;
+    const signature = JSON.stringify(snapshot);
+    if (signature === String(state.headerBoxSignature || '')) return false;
+    state.headerBoxSignature = signature;
+    const fluid = refs.panel.querySelector('.pp-headerFluid');
+    if (!fluid) return false;
+
+    if (snapshot.backgroundColor) refs.header.style.backgroundColor = snapshot.backgroundColor;
+    if (snapshot.backgroundImage && snapshot.backgroundImage !== 'none') refs.header.style.backgroundImage = snapshot.backgroundImage;
+    refs.header.style.minHeight = snapshot.minHeight || '';
+    fluid.style.minHeight = snapshot.fluidMinHeight || snapshot.minHeight || '';
+    fluid.style.paddingLeft = snapshot.paddingLeft || '';
+    fluid.style.paddingRight = snapshot.paddingRight || '';
+    fluid.style.paddingTop = snapshot.paddingTop || '';
+    fluid.style.paddingBottom = snapshot.paddingBottom || '';
+    if (snapshot.borderBottomColor) refs.header.style.borderBottomColor = snapshot.borderBottomColor;
+    return true;
+  }
+
+  function syncHeaderStylesFromNative(snapshot = null) {
+    if (!isPanelAlive()) return false;
+    ensureHeaderRefs();
+    snapshot = snapshot || readNativeHeaderStyleSnapshot();
+    if (!snapshot) return false;
+    applyNativeHeaderBoxSnapshot();
+    const signature = JSON.stringify(snapshot || {});
+    if (signature === String(state.headerStyleSignature || '')) return false;
+    state.headerStyleSignature = signature;
+    applyInlineHeaderTextStyle(refs.headerBrand, snapshot.brandStyle || snapshot.navStyle);
+    [...refs.panel.querySelectorAll('#ppTabs .pp-navItem')].forEach((button) => {
+      applyInlineHeaderTextStyle(button, snapshot.navStyle);
+    });
+    applyInlineHeaderTextStyle(refs.headerUserWrap, snapshot.userStyle || snapshot.navStyle);
+    applyInlineHeaderTextStyle(refs.headerLogoutBtn, snapshot.logoutStyle || snapshot.userStyle || snapshot.navStyle);
+    applyInlineHeaderTextStyle(refs.headerClockWrap, snapshot.clockStyle || snapshot.userStyle || snapshot.navStyle);
+    const userTextNodes = [refs.headerUserPrimary, refs.headerUserSecondary, refs.headerUserDivider, refs.headerLogoutText, refs.headerClockText].filter(Boolean);
+    userTextNodes.forEach((node) => {
+      const source = node === refs.headerClockText ? (snapshot.clockStyle || snapshot.userStyle || snapshot.navStyle) : (snapshot.userStyle || snapshot.navStyle);
+      if (!source) return;
+      try {
+        node.style.fontFamily = source.fontFamily || '';
+        node.style.fontSize = source.fontSize || '';
+        node.style.fontWeight = source.fontWeight || '';
+        node.style.lineHeight = source.lineHeight || '';
+        node.style.letterSpacing = source.letterSpacing || '';
+        node.style.textTransform = source.textTransform || '';
+      } catch (_) {}
+    });
+    refs.panel.style.setProperty('--pp-native-header-font-family', (snapshot.navStyle && snapshot.navStyle.fontFamily) || 'Ubuntu, sans-serif');
+    refs.panel.style.setProperty('--pp-native-header-font-size', (snapshot.navStyle && snapshot.navStyle.fontSize) || '12px');
+    refs.panel.style.setProperty('--pp-native-header-weight', (snapshot.navStyle && snapshot.navStyle.fontWeight) || '400');
+    return true;
+  }
+
+  function syncHeaderFromNative(force = false) {
+    if (!isPanelAlive()) return;
+    ensureHeaderRefs();
+    if (force) {
+      state.headerSnapshotSignature = '';
+      state.headerStyleSignature = '';
+      state.headerNavSignature = '';
+      state.headerBoxSignature = '';
+    }
+    const textSnapshot = readNativeHeaderSnapshot();
+    const styleSnapshot = readNativeHeaderStyleSnapshot();
+    const navModel = readNativePrimaryNavModel();
+    renderHeaderNavFromNative(navModel, force);
+    applyHeaderSnapshot(textSnapshot);
+    syncHeaderStylesFromNative(styleSnapshot);
+  }
+
+  function startHeaderChromeSync() {
+    ensureHeaderRefs();
+    syncHeaderFromNative(true);
+
+    let rafId = 0;
+    const queueSync = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        try { syncHeaderFromNative(); } catch (_) {}
+      });
+    };
+
+    const tick = window.setInterval(queueSync, 700);
+    state.cleanupFns.push(() => clearInterval(tick));
+
+    if (typeof MutationObserver === 'function' && document.documentElement) {
+      const observer = new MutationObserver((mutations) => {
+        const shouldSync = mutations.some((mutation) => {
+          const target = mutation && mutation.target;
+          return target && (target.nodeType === 1 || target.nodeType === 3);
+        });
+        if (shouldSync) queueSync();
+      });
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'href', 'onclick']
+      });
+      state.cleanupFns.push(() => {
+        try { observer.disconnect(); } catch (_) {}
+      });
+    }
+
+    if (refs.headerBrand && !refs.headerBrand.__ppDynamicHeaderBound) {
+      refs.headerBrand.__ppDynamicHeaderBound = true;
+      refs.headerBrand.addEventListener('click', (event) => {
+        event.preventDefault();
+        const target = cleanHeaderText(refs.headerBrand.dataset.nativeMenuTarget) || 'menuProvider';
+        if (!triggerNativeHeaderAction(target, cleanHeaderText(refs.headerBrand.textContent || ''))) {
+          try {
+            if (typeof window.switchMenu === 'function') window.switchMenu('menuProvider');
+          } catch (_) {}
+        }
+      });
+    }
+
+    if (refs.headerLogoutBtn && !refs.headerLogoutBtn.__ppDynamicHeaderBound) {
+      refs.headerLogoutBtn.__ppDynamicHeaderBound = true;
+      refs.headerLogoutBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        const node = findNativeHeaderActionNode('', cleanHeaderText(refs.headerLogoutText && refs.headerLogoutText.textContent || 'Logout'));
+        if (node) {
+          try {
+            node.click();
+            return;
+          } catch (_) {}
+        }
+        try {
+          if (typeof window.logout === 'function') window.logout();
+        } catch (_) {}
+      });
+    }
+  }
+
+  function switchTab(type) {
+    if (!isAuthenticated()) return;
+    state.activeTab = type;
+    getLivePanelTabButtons().forEach((button) => button.classList.toggle('is-active', button.dataset.tab === type));
+    refs.depoTab.style.display = type === 'depo' ? 'block' : 'none';
+    refs.wdTab.style.display = type === 'wd' ? 'block' : 'none';
+    if (typeof hideUserTab === 'function') {
+      try { hideUserTab(); } catch (_) {}
+    }
+    syncNativeMenu(type);
+
+    if (!isInteractionLocked(type)) {
+      flushDeferredRender(type);
+    }
+
+    if (!state.initialized[type] && !state.loading[type]) {
+      loadSection(type, { initial: true });
+      return;
+    }
+
+    if (!state.loading[type] && Date.now() - (state.lastLoadedAt[type] || 0) > 1200) {
+      loadSection(type, { busyText: 'Syncing...', silent: true });
+    }
+    if (type === 'depo') {
+      renderDepositAutoApproveUi(refs.depoTab);
+      scheduleDepositAutoApprove(state.depo.autoApprove ? 90 : 200);
+    } else {
+      clearDepositAutoApproveTimer();
+    }
+  }
+
 })();
 
 
@@ -5439,15 +8184,15 @@ function getDepositExactAmountInput(row, id) {
 
       if (/\/approveDeposit\b/i.test(url)) {
         if (!shouldRun("approve-deposit")) return;
-        queueMicrotask(() => schedulePanelRefresh("depo", true));
-        queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [120, 420, 900, 1700, 3000, 5200, 7600] }));
+        queueMicrotask(() => boostPanelRefresh('depo'));
+        queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [50, 160, 420, 900, 1800, 3600] }));
         return;
       }
 
       if (/\/approveWithdraw\b/i.test(url)) {
         if (!shouldRun("approve-withdraw")) return;
-        queueMicrotask(() => schedulePanelRefresh("wd", true));
-        queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [120, 420, 900, 1700, 3000, 5200, 7600] }));
+        queueMicrotask(() => boostPanelRefresh('wd'));
+        queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [50, 160, 420, 900, 1800, 3600] }));
         return;
       }
 
@@ -5616,7 +8361,7 @@ function getDepositExactAmountInput(row, id) {
 
   function isAbortLike(error) {
     const msg = String(error && (error.message || error) || "").toLowerCase();
-    return !!(error && error.name === "AbortError") || msg.includes("aborted") || msg.includes("abort") || msg.includes("timeout");
+    return !!(error && (error.name === "AbortError" || error.name === "TimeoutError" || error.isTimeout)) || msg.includes("aborted") || msg.includes("abort") || msg.includes("timeout");
   }
 
   function parseGsResponseBody(raw) {
@@ -5648,6 +8393,14 @@ function getDepositExactAmountInput(row, id) {
     const parsed = body.parsed;
     const lower = body.lower;
     const message = pickGsResponseMessage(parsed, body.raw);
+    const busySignal = !!(
+      /\bbusy(?:[_\s-]*(?:script|document|sheet|lock))?\b/i.test(message || "") ||
+      /\bbusy(?:[_\s-]*(?:script|document|sheet|lock))?\b/i.test(body.raw || "") ||
+      lower.includes("busy_script") ||
+      lower.includes("busy_document") ||
+      lower.includes('"retry":true') ||
+      lower.includes('"busy":true')
+    );
 
     const explicitOk = !!(
       (parsed && typeof parsed === "object" && (parsed.ok === true || parsed.success === true || String(parsed.status || "").toLowerCase() === "success" || String(parsed.result || "").toLowerCase() === "success")) ||
@@ -5664,12 +8417,16 @@ function getDepositExactAmountInput(row, id) {
     );
 
     if (!(res && res.ok)) {
-      if (status >= 400 && status < 500 && status !== 429) {
+      if (busySignal || status === 408 || status === 425 || status === 429) {
+        return { kind: "retry", status, message: message || `HTTP ${status || 0}` };
+      }
+      if (status >= 400 && status < 500) {
         return { kind: "fail", status, message: message || `HTTP ${status}` };
       }
       return { kind: "retry", status, message: message || `HTTP ${status || 0}` };
     }
 
+    if (busySignal) return { kind: "retry", status: status || 200, message: message || `HTTP ${status || 200}` };
     if (explicitFail) return { kind: "fail", status, message: message || `HTTP ${status || 200}` };
     if (explicitOk) return { kind: "success", status, message: message || `HTTP ${status || 200}` };
     if (!body.raw || status === 204) return { kind: "success", status: status || 204, message: message || `HTTP ${status || 204}` };
@@ -5773,7 +8530,7 @@ function getDepositExactAmountInput(row, id) {
     }
   }
 
-  function saveCfg(next) {
+  function saveCfg(next, options = {}) {
     const cfg = {
       enabled: !!next.enabled,
       autoCopy: !!next.autoCopy,
@@ -5782,7 +8539,9 @@ function getDepositExactAmountInput(row, id) {
       stats: { ...DEFAULT_CFG.stats, ...(next.stats || {}) }
     };
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch (_) {}
-    queueUserTabRender(0);
+    if (options.render !== false) {
+      queueUserTabRender(typeof options.delay === "number" ? options.delay : 0, { force: !!options.force });
+    }
     return cfg;
   }
 
@@ -5817,7 +8576,7 @@ function getDepositExactAmountInput(row, id) {
   function updateStats(patch) {
     const cfg = loadCfg();
     cfg.stats = { ...cfg.stats, ...(patch || {}) };
-    saveCfg(cfg);
+    saveCfg(cfg, { render: false });
   }
 
   function loadSeen() {
@@ -6069,6 +8828,9 @@ function getDepositExactAmountInput(row, id) {
 
     try {
       filtered.forEach((row) => {
+        if (!hasQueuedRowTargetCol(type, row)) {
+          return;
+        }
         const endpointInfo = resolveEndpointForQueuedRow(type, row, urls);
         if (!endpointInfo.url) {
           fallbackRows.push(row);
@@ -6152,33 +8914,21 @@ function getDepositExactAmountInput(row, id) {
   }
 
   async function copyPlainText(text) {
-    const value = String(text || "").replace(/\r/g, "").trim();
-    if (!value) return false;
-    try {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-        await navigator.clipboard.writeText(value);
-        return true;
-      }
-    } catch (_) {}
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = value;
-      ta.setAttribute("readonly", "readonly");
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      ta.style.pointerEvents = "none";
-      ta.style.top = "-9999px";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      const ok = document.execCommand("copy");
-      ta.remove();
-      return !!ok;
-    } catch (_) {
-      return false;
-    }
+    const helper = (typeof copyPlainTextSafe === 'function')
+      ? copyPlainTextSafe
+      : ((typeof window !== 'undefined' && window && typeof window.copyPlainTextSafe === 'function')
+          ? window.copyPlainTextSafe
+          : ((typeof window !== 'undefined' && window && typeof window.__ppCopyPlainTextSafe === 'function')
+              ? window.__ppCopyPlainTextSafe
+              : ((typeof window !== 'undefined' && window && typeof window.copyPlainText === 'function') ? window.copyPlainText : null)));
+    return helper ? helper(text) : false;
   }
+
+  try {
+    if (typeof window !== 'undefined' && window) {
+      window.copyPlainText = copyPlainText;
+    }
+  } catch (_) {}
 
   function getCopyMatrix(type, rows) {
     return (Array.isArray(rows) ? rows : []).map((row) => {
@@ -6187,9 +8937,23 @@ function getDepositExactAmountInput(row, id) {
         return [arr[0] || "", arr[1] || "", arr[2] || "", arr[3] || "", arr[4] || "", arr[5] || "", arr[6] || ""]
           .map((v) => String(v == null ? "" : v));
       }
+      if (type === "withdraw") {
+        return [arr[0] || "", arr[1] || "", arr[2] || ""]
+          .map((v) => String(v == null ? "" : v));
+      }
       return [arr[0] || "", arr[1] || "", arr[2] || ""]
         .map((v) => String(v == null ? "" : v));
     }).filter((cells) => cells.some((value) => String(value || "") !== ""));
+  }
+
+  function getQueuedRowTargetCol(type, row) {
+    const arr = Array.isArray(row) ? row : [];
+    const index = type === "pulsa" ? 7 : 6;
+    return String(arr[index] == null ? "" : arr[index]).trim();
+  }
+
+  function hasQueuedRowTargetCol(type, row) {
+    return !!getQueuedRowTargetCol(type, row);
   }
 
   function buildCopyTextFromMatrix(matrix) {
@@ -6233,7 +8997,14 @@ function getDepositExactAmountInput(row, id) {
         return true;
       }
     } catch (_) {}
-    return copyPlainText(text);
+    const fallbackCopy = (typeof copyPlainTextSafe === 'function')
+      ? copyPlainTextSafe
+      : ((typeof window !== 'undefined' && window && typeof window.copyPlainTextSafe === 'function')
+          ? window.copyPlainTextSafe
+          : ((typeof window !== 'undefined' && window && typeof window.__ppCopyPlainTextSafe === 'function')
+              ? window.__ppCopyPlainTextSafe
+              : ((typeof window !== 'undefined' && window && typeof window.copyPlainText === 'function') ? window.copyPlainText : null)));
+    return fallbackCopy ? fallbackCopy(text) : false;
   }
 
   async function autoCopyPayload(payload) {
@@ -6242,14 +9013,16 @@ function getDepositExactAmountInput(row, id) {
     if (!matrix.length) return false;
     const text = buildCopyTextFromMatrix(matrix);
     const ok = await copyStructuredMatrix(matrix);
-    if (ok) console.info("[PP-AUTO-COPY] copied", payload.type, text);
-    else console.warn("[PP-AUTO-COPY] failed", payload.type);
+    void text;
+    return ok;
     return ok;
   }
 
   async function timeoutFetch(url, body, timeoutMs = 9000) {
     const ctrl = window.AbortController ? new AbortController() : null;
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       try { ctrl && ctrl.abort(); } catch (_) {}
     }, timeoutMs);
 
@@ -6260,6 +9033,14 @@ function getDepositExactAmountInput(row, id) {
         body: new URLSearchParams({ data: JSON.stringify(body) }),
         signal: ctrl ? ctrl.signal : undefined
       });
+    } catch (error) {
+      if (timedOut) {
+        const timeoutError = new Error(`Request timeout after ${timeoutMs}ms`);
+        timeoutError.name = "TimeoutError";
+        timeoutError.isTimeout = true;
+        throw timeoutError;
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
@@ -6419,6 +9200,9 @@ function getDepositExactAmountInput(row, id) {
 
         const bucketMap = new Map();
         filtered.forEach((row) => {
+          if (!hasQueuedRowTargetCol(item.type, row)) {
+            return;
+          }
           const endpointInfo = resolveEndpointForQueuedRow(item.type, row, urls);
           if (!endpointInfo.url) {
             memoryQueue[item.type].push(row);
@@ -6609,6 +9393,18 @@ function getDepositExactAmountInput(row, id) {
     const upper = raw.toUpperCase();
     const norm = normalizeBankKey(raw);
     if (knownKeys.includes(norm)) return norm;
+
+    const contextual = upper
+      .replace(/SEA\s*BANK/g, "SEABANK")
+      .replace(/SYARIAH\s+INDONESIA/g, "BSI")
+      .replace(/LINK\s*AJA/g, "LINKAJA");
+
+    const sourceFirst = contextual.match(/\b(BCA|MANDIRI|BNI|BRI|BSI|CIMB|SEABANK|DANAMON|ANTARBANK|JENIUS|DANA|OVO|GOPAY|LINKAJA)\b\s*(?:KE|TO|TRANSFER\s+KE|->|>|\/)/);
+    if (sourceFirst && knownKeys.includes(sourceFirst[1])) return sourceFirst[1];
+
+    const fromFirst = contextual.match(/\bFROM\s+(BCA|MANDIRI|BNI|BRI|BSI|CIMB|SEABANK|DANAMON|ANTARBANK|JENIUS|DANA|OVO|GOPAY|LINKAJA)\b/);
+    if (fromFirst && knownKeys.includes(fromFirst[1])) return fromFirst[1];
+
     for (const key of knownKeys) {
       if (key === "SEABANK" && /SEA\s*BANK|SEABANK/.test(upper)) return "SEABANK";
       if (key === "BSI" && /BSI|SYARIAH INDONESIA/.test(upper)) return "BSI";
@@ -6621,6 +9417,18 @@ function getDepositExactAmountInput(row, id) {
   function getWithdrawSourceKey(row, id) {
     if (!row) return "";
     const known = ["BCA","MANDIRI","BNI","BRI","BSI","CIMB","SEABANK","DANAMON","ANTARBANK","JENIUS","DANA","OVO","GOPAY","LINKAJA"];
+
+    const sourceWrap = row.children && row.children[4] ? row.children[4] : null;
+    if (sourceWrap) {
+      const visualBank = getBankNameFromRow(sourceWrap) || getBankNameFromRow(row);
+      if (visualBank && known.includes(visualBank)) return visualBank;
+      const sourceTexts = collectRowStrings(sourceWrap);
+      for (const text of sourceTexts) {
+        const match = findKnownTransferKey(text, known);
+        if (match) return match;
+      }
+    }
+
     const wdInput = row.querySelector(`#wdrek${id}`) || row.querySelector(`.wdrekform[att="${id}"]`) || row.querySelector(".wdrekform");
     const direct = findKnownTransferKey(textFromNode(wdInput), known);
     if (direct) return direct;
@@ -6632,6 +9440,9 @@ function getDepositExactAmountInput(row, id) {
       const mapped = foundText ? findKnownTransferKey(foundText, known) : "";
       if (mapped) return mapped;
     }
+
+    const rowVisualBank = getBankNameFromRow(row);
+    if (rowVisualBank && known.includes(rowVisualBank)) return rowVisualBank;
 
     const texts = collectRowStrings(row);
     for (const text of texts) {
@@ -6877,13 +9688,14 @@ function getDepositExactAmountInput(row, id) {
     const nominal = getNominalFromRow(row, id);
     const nomorSn = getNumberOrSnFromRow(row);
     const targetCol = pickTargetCol(targetKey || (route === "pulsa" ? "TELKOMSEL" : ""));
-    if (!targetCol || !nama || !username || !nominal) return null;
+    if (!nama || !username || !nominal) return null;
 
     if (route === "pulsa") {
       const potongan = nominal * 0.05;
       const jumlahDiproses = nominal - potongan;
       return {
         type: "pulsa",
+        gsReady: !!targetCol,
         rows: [[nomorSn || "", nama, username, formatNumber(jumlahDiproses), formatNumber(potongan), "", formatNumber(nominal), targetCol]]
       };
     }
@@ -6892,6 +9704,7 @@ function getDepositExactAmountInput(row, id) {
     const nonce = "DEP-N-" + id;
     return {
       type: route,
+      gsReady: !!targetCol,
       rows: [[nama, username, formatNumber(nominal), targetKey || sourceKey || "DEPOSIT", txKey, nonce, targetCol]]
     };
   }
@@ -6904,11 +9717,12 @@ function getDepositExactAmountInput(row, id) {
     const nominal = getNominalFromRow(row, id);
     const sourceKey = getWithdrawSourceKey(row, id);
     const targetCol = pickWithdrawTargetCol(sourceKey);
-    if (!targetCol || !nama || !username || !nominal) return null;
+    if (!nama || !username || !nominal) return null;
     const txKey = "WD-" + id;
     const nonce = "WD-N-" + id;
     return {
       type: "withdraw",
+      gsReady: !!targetCol,
       rows: [[nama, username, "(" + formatNumber(nominal) + ")", sourceKey ? "WITHDRAW " + sourceKey : "WITHDRAW", txKey, nonce, targetCol]]
     };
   }
@@ -6994,7 +9808,153 @@ function getDepositExactAmountInput(row, id) {
     return true;
   }
 
-  function waitForPendingRowRemoval(kind, id, timeoutMs = 5000, intervalMs = 160) {
+  const GS_OPTIMISTIC_PENDING_ROWS = { depo: new Map(), wd: new Map() };
+
+  function gsCssEscapeSafe(value) {
+    if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(String(value));
+    return String(value == null ? '' : value).replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+  }
+
+  function getPanelRoot() {
+    return document.getElementById(PANEL_ID);
+  }
+
+  function getPanelTab(type) {
+    const panelRoot = getPanelRoot();
+    if (!panelRoot) return null;
+    return panelRoot.querySelector(type === 'wd' ? '#ppWdTab' : '#ppDepoTab');
+  }
+
+  function getPanelInstance() {
+    const instance = window[INSTANCE_KEY];
+    return instance && typeof instance === 'object' ? instance : null;
+  }
+
+  function pruneGsOptimisticPendingRows(type) {
+    const key = type === 'wd' ? 'wd' : 'depo';
+    const bucket = GS_OPTIMISTIC_PENDING_ROWS[key];
+    const nowTs = Date.now();
+    bucket.forEach((expireAt, rowId) => {
+      if (!expireAt || nowTs >= expireAt) bucket.delete(rowId);
+    });
+    return bucket;
+  }
+
+  function markGsOptimisticPendingRow(type, id, ttlMs = 2600) {
+    if (id == null || id === '') return false;
+    const bucket = pruneGsOptimisticPendingRows(type);
+    bucket.set(String(id), Date.now() + Math.max(900, Number(ttlMs) || 0));
+    return true;
+  }
+
+  function refreshPendingBadgesFromDom() {
+    const panelRoot = getPanelRoot();
+    if (!panelRoot) return false;
+    const counts = {
+      depo: panelRoot.querySelectorAll('#ppDepoTab tr[id^="depositPending-"]:not([data-pp-optimistic-gone="1"])').length,
+      wd: panelRoot.querySelectorAll('#ppWdTab tr[id^="withdrawPending-"]:not([data-pp-optimistic-gone="1"])').length
+    };
+    const depoBadge = panelRoot.querySelector('#ppDepoBadge');
+    const wdBadge = panelRoot.querySelector('#ppWdBadge');
+    if (depoBadge) depoBadge.textContent = String(counts.depo);
+    if (wdBadge) wdBadge.textContent = String(counts.wd);
+    return true;
+  }
+
+  function updatePendingEmptyState(type) {
+    const tab = getPanelTab(type);
+    if (!tab) return;
+    const rowSelector = type === 'depo' ? 'tr[id^="depositPending-"]:not([data-pp-optimistic-gone="1"])' : 'tr[id^="withdrawPending-"]:not([data-pp-optimistic-gone="1"])';
+    const tbody = tab.querySelector('.pp-tableWrap tbody, table tbody');
+    if (!tbody) return;
+    const hasRows = !!tbody.querySelector(rowSelector);
+    const existing = tbody.querySelector('tr.pp-emptyPendingRow');
+    if (hasRows) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) return;
+    const table = tbody.closest('table');
+    const headCount = table ? table.querySelectorAll('thead tr:last-child th').length : 0;
+    const bodyCount = tbody.querySelector('tr') ? tbody.querySelector('tr').children.length : 0;
+    const colCount = Math.max(1, headCount || bodyCount || 1);
+    const tr = document.createElement('tr');
+    tr.className = 'pp-emptyPendingRow';
+    tr.innerHTML = `<td colspan="${colCount}" style="text-align:center;padding:14px 10px;color:#7f1d1d;font-size:12px;">Tidak ada pending.</td>`;
+    tbody.appendChild(tr);
+  }
+
+  function optimisticConsumePendingRow(kind, id) {
+    const normalizedKind = kind === 'withdraw' ? 'withdraw' : 'deposit';
+    const type = normalizedKind === 'withdraw' ? 'wd' : 'depo';
+    const normalizedId = String(id == null ? '' : id).trim();
+    markGsOptimisticPendingRow(type, normalizedId, normalizedKind === 'withdraw' ? 2600 : 3200);
+    const selector = `#${normalizedKind === 'withdraw' ? 'withdrawPending-' : 'depositPending-'}${gsCssEscapeSafe(normalizedId)}`;
+    const row = document.querySelector(selector);
+    if (!row || row.dataset.ppOptimisticGone === '1') {
+      refreshPendingBadgesFromDom();
+      return false;
+    }
+    row.dataset.ppOptimisticGone = '1';
+    row.setAttribute('data-pp-optimistic-gone', '1');
+    row.style.pointerEvents = 'none';
+    row.style.willChange = 'opacity, transform, height, margin, padding';
+    row.style.transition = 'opacity .08s ease, transform .08s ease, height .1s ease, margin .1s ease, padding .1s ease';
+    row.style.opacity = '.18';
+    row.style.transform = 'translateY(-1px) scale(.995)';
+    refreshPendingBadgesFromDom();
+    window.setTimeout(() => {
+      if (!row.isConnected) return;
+      row.style.opacity = '0';
+      row.style.transform = 'translateY(-2px) scale(.99)';
+      row.style.height = '0px';
+      row.style.minHeight = '0px';
+      row.style.marginTop = '0px';
+      row.style.marginBottom = '0px';
+      row.style.paddingTop = '0px';
+      row.style.paddingBottom = '0px';
+    }, 6);
+    window.setTimeout(() => {
+      try { if (row.isConnected) row.remove(); } catch (_) {}
+      try { refreshPendingBadgesFromDom(); } catch (_) {}
+      try { updatePendingEmptyState(type); } catch (_) {}
+    }, 72);
+    return true;
+  }
+
+  function boostPanelRefresh(type) {
+    const normalizedType = type === 'wd' ? 'wd' : 'depo';
+    const instance = getPanelInstance();
+    if (instance && typeof instance.refresh === 'function') {
+      try {
+        instance.refresh(normalizedType);
+        return true;
+      } catch (_) {}
+    }
+    const tab = getPanelTab(normalizedType);
+    if (!tab) return false;
+    const activeButton = getPanelRoot() && getPanelRoot().querySelector(`.pp-tabButton[data-tab="${normalizedType}"]`);
+    if (activeButton && typeof activeButton.click === 'function') {
+      try {
+        activeButton.click();
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function burstPanelRefresh(type, delays = [0, 110, 260, 620]) {
+    const normalizedType = type === 'wd' ? 'wd' : 'depo';
+    const uniqueDelays = [...new Set((Array.isArray(delays) ? delays : [delays]).map((value) => Math.max(0, Number(value) || 0)))];
+    uniqueDelays.forEach((delay) => {
+      window.setTimeout(() => {
+        if (!getPanelRoot()) return;
+        boostPanelRefresh(normalizedType);
+      }, delay);
+    });
+  }
+
+  function waitForPendingRowRemoval(kind, id, timeoutMs = 5000, intervalMs = 80) {
     return new Promise((resolve) => {
       const startedAt = now();
       const selector = `#${kind === "deposit" ? "depositPending-" : "withdrawPending-"}${id}`;
@@ -7051,7 +10011,7 @@ function getDepositExactAmountInput(row, id) {
       const ctx = consumeApproveContext("deposit", id);
       let payload = null;
       try {
-        if (ctx && id && (isGsOn() || isAutoCopyOn())) {
+        if (id && (isGsOn() || isAutoCopyOn())) {
           payload = buildDepositPayload(id);
         }
       } catch (error) {
@@ -7062,25 +10022,29 @@ function getDepositExactAmountInput(row, id) {
         const handled = shouldProcessNativeAction(meta);
 
         if (handled) {
-          queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [220, 850, 1800, 3200, 5200, 7800] }));
+          optimisticConsumePendingRow('deposit', id);
+          queueMicrotask(() => burstPanelRefresh('depo', [0, 90, 220, 520, 1200]));
+          queueMicrotask(() => window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [60, 160, 420, 1100, 2400, 4200] }));
         }
 
-        if (handled && ctx && payload && payload.rows && payload.rows.length) {
+        if (handled && payload && payload.rows && payload.rows.length) {
           if (isAutoCopyOn()) {
-            queueMicrotask(() => autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] deposit failed", error)));
+            queueMicrotask(() => autoCopyPayload(payload).catch(() => {}));
           }
 
           queueMicrotask(async () => {
             try {
               if (recentlyHandled("panel-approve:deposit:" + id, 8000)) return;
-              const fastLaneTask = isGsOn()
+              const fastLaneTask = isGsOn() && payload.gsReady !== false
                 ? sendToGSheetBatch(payload.rows, payload.type, { fastLane: true, holdMs: ctx && ctx.source === "auto-deposit" ? 14000 : 12000, retry: 2, baseDelay: 140 })
                 : Promise.resolve(null);
-              const removed = await waitForPendingRowRemoval("deposit", id, ctx && ctx.source === "auto-deposit" ? 2600 : 1600, 120);
+              const removed = await waitForPendingRowRemoval("deposit", id, ctx && ctx.source === "auto-deposit" ? 2200 : 900, 45);
               if (!removed) {
-                window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [900, 2200, 4200, 6800, 9600] });
+                burstPanelRefresh('depo', [0, 120, 320, 760, 1600]);
+                window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [220, 760, 1800, 3600, 5600] });
               } else {
-                window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [180, 700, 1500, 2800, 4800, 7200] });
+                clearOptimisticPendingRow('depo', id);
+                window.triggerDepositApprovedHistoryRefreshWave({ forceBusy: false, delays: [40, 120, 360, 900, 2200, 4200] });
               }
               await Promise.resolve(fastLaneTask);
             } catch (error) {
@@ -7104,7 +10068,7 @@ function getDepositExactAmountInput(row, id) {
       const ctx = consumeApproveContext("withdraw", id);
       let payload = null;
       try {
-        if (ctx && id && (isGsOn() || isAutoCopyOn())) {
+        if (id && (isGsOn() || isAutoCopyOn())) {
           payload = buildWithdrawPayload(id);
         }
       } catch (error) {
@@ -7115,25 +10079,29 @@ function getDepositExactAmountInput(row, id) {
         const handled = shouldProcessNativeAction(meta);
 
         if (handled) {
-          queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [220, 850, 1800, 3200, 5200, 7800] }));
+          optimisticConsumePendingRow('withdraw', id);
+          queueMicrotask(() => burstPanelRefresh('wd', [0, 90, 220, 520, 1200]));
+          queueMicrotask(() => window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [60, 160, 420, 1100, 2400, 4200] }));
         }
 
-        if (handled && ctx && payload && payload.rows && payload.rows.length) {
+        if (handled && payload && payload.rows && payload.rows.length) {
           if (isAutoCopyOn()) {
-            queueMicrotask(() => autoCopyPayload(payload).catch((error) => console.warn("[PP-AUTO-COPY] withdraw failed", error)));
+            queueMicrotask(() => autoCopyPayload(payload).catch(() => {}));
           }
 
           queueMicrotask(async () => {
             try {
               if (recentlyHandled("panel-approve:withdraw:" + id, 8000)) return;
-              const fastLaneTask = isGsOn()
+              const fastLaneTask = isGsOn() && payload.gsReady !== false
                 ? sendToGSheetBatch(payload.rows, payload.type, { fastLane: true, holdMs: 12000, retry: 2, baseDelay: 140 })
                 : Promise.resolve(null);
-              const removed = await waitForPendingRowRemoval("withdraw", id, 1600, 120);
+              const removed = await waitForPendingRowRemoval("withdraw", id, 900, 45);
               if (!removed) {
-                window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [900, 2200, 4200, 6800, 9600] });
+                burstPanelRefresh('wd', [0, 120, 320, 760, 1600]);
+                window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [220, 760, 1800, 3600, 5600] });
               } else {
-                window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [180, 700, 1500, 2800, 4800, 7200] });
+                clearOptimisticPendingRow('wd', id);
+                window.triggerWithdrawApprovedHistoryRefreshWave({ forceBusy: false, delays: [40, 120, 360, 900, 2200, 4200] });
               }
               await Promise.resolve(fastLaneTask);
             } catch (error) {
@@ -7484,7 +10452,6 @@ function getDepositExactAmountInput(row, id) {
         const detail = `HTTP ${res.status}
 Target Col: ${result.targetCol}
 Response: ${snippet}`;
-        console.warn("[Pending Panel][Test Send Failed]", { status: res.status, targetCol: result.targetCol, response: bodyText, endpoint: result.endpoint, type });
         setTestStatus(tab, "Test Gagal", "err", detail);
         emitGsStatusToast(`Google Sheet gagal: test ${type} ditolak endpoint.`, "fail", 3200, `test-fail|${type}|${res.status}`);
         return;
@@ -7493,20 +10460,27 @@ Response: ${snippet}`;
       const detail = `HTTP ${res.status}
 Target Col: ${result.targetCol}
 Response: ${snippet}`;
+      if (outcome.kind === "retry") {
+        setTestStatus(tab, "Test Busy", "", detail);
+        emitGsStatusToast(`Google Sheet sibuk: test ${type} belum bisa diproses sekarang.`, "info", 2400, `test-busy|${type}|${outcome.message || ""}`);
+        return;
+      }
       if (outcome.kind === "fail") {
-        console.warn("[Pending Panel][Test Send Failed]", { status: res.status, targetCol: result.targetCol, response: bodyText, endpoint: result.endpoint, type });
         setTestStatus(tab, "Test Gagal", "err", detail);
         emitGsStatusToast(`Google Sheet gagal: test ${type} dibalas gagal oleh endpoint.`, "fail", 3200, `test-fail-body|${type}|${outcome.message || ""}`);
         return;
       }
-      console.info("[Pending Panel][Test Send OK]", { status: res.status, targetCol: result.targetCol, response: bodyText, endpoint: result.endpoint, type });
       setTestStatus(tab, "Test Berhasil", "ok", detail);
       emitGsStatusToast(`Google Sheet berhasil: test ${type} terkirim.`, "success", 2200, `test-ok|${type}|${result.targetCol}`);
     } catch (error) {
       const detail = error && error.message ? error.message : String(error);
-      console.error("[Pending Panel][Test Send Error]", error);
-      setTestStatus(tab, "Test Error", "err", detail);
-      emitGsStatusToast(`Google Sheet error: test ${type} ${isAbortLike(error) ? "timeout / dibatalkan" : "bermasalah"}.`, "error", 3400, `test-err|${type}|${detail}`);
+      if (isAbortLike(error)) {
+        setTestStatus(tab, "Test Timeout", "", detail);
+        emitGsStatusToast(`Google Sheet error: test ${type} timeout / dibatalkan.`, "error", 3400, `test-timeout|${type}|${detail}`);
+      } else {
+        setTestStatus(tab, "Test Error", "err", detail);
+        emitGsStatusToast(`Google Sheet error: test ${type} bermasalah.`, "error", 3400, `test-err|${type}|${detail}`);
+      }
     } finally {
       if (sendBtn) {
         sendBtn.disabled = false;
@@ -7690,6 +10664,30 @@ Response: ${snippet}`;
   }
 
   let userTabRenderTimer = 0;
+  let lastUserTabRenderSignature = "";
+
+  function getUserTabRenderSignature() {
+    const cfg = loadCfg();
+    return JSON.stringify({
+      enabled: !!cfg.enabled,
+      autoCopy: !!cfg.autoCopy,
+      urls: cfg.urls || {},
+      colMap: cfg.colMap || {}
+    });
+  }
+
+  function isUserTabBusy(tab) {
+    if (!tab) return false;
+    const active = document.activeElement;
+    if (active && tab.contains(active)) return true;
+    try {
+      if (typeof tab.matches === "function" && tab.matches(":hover")) return true;
+    } catch (_) {}
+    try {
+      if (tab.querySelector(":hover")) return true;
+    } catch (_) {}
+    return false;
+  }
 
   function captureUserTabUiState(tab) {
     if (!tab) return null;
@@ -7733,15 +10731,16 @@ Response: ${snippet}`;
     }
   }
 
-  function queueUserTabRender(delay = 60) {
+  function queueUserTabRender(delay = 60, options = {}) {
     if (userTabRenderTimer) {
       clearTimeout(userTabRenderTimer);
       userTabRenderTimer = 0;
     }
+    const wait = Math.max(0, delay || 0);
     userTabRenderTimer = window.setTimeout(() => {
       userTabRenderTimer = 0;
-      renderUserTabIfVisible();
-    }, Math.max(0, delay || 0));
+      renderUserTabIfVisible(options || {});
+    }, wait);
   }
 
   function bindUserTab(tab) {
@@ -7850,7 +10849,14 @@ Response: ${snippet}`;
       endpointPreviewBox.addEventListener("click", async () => {
         const fullUrl = String(endpointPreviewBox.dataset.fullUrl || "").trim();
         if (!fullUrl) return;
-        const ok = await copyPlainText(fullUrl);
+        const helper = (typeof copyPlainTextSafe === 'function')
+          ? copyPlainTextSafe
+          : ((typeof window !== 'undefined' && window && typeof window.copyPlainTextSafe === 'function')
+              ? window.copyPlainTextSafe
+              : ((typeof window !== 'undefined' && window && typeof window.__ppCopyPlainTextSafe === 'function')
+                  ? window.__ppCopyPlainTextSafe
+                  : ((typeof window !== 'undefined' && window && typeof window.copyPlainText === 'function') ? window.copyPlainText : null)));
+        const ok = helper ? await helper(fullUrl) : false;
         endpointPreviewBox.title = ok ? `${fullUrl}\n\nEndpoint penuh berhasil dicopy.` : fullUrl;
       });
     }
@@ -7871,13 +10877,27 @@ Response: ${snippet}`;
     }
   }
 
-  function renderUserTabIfVisible() {
+  function renderUserTabIfVisible(options = {}) {
     const tab = document.getElementById(USER_TAB_ID);
     if (!tab || tab.style.display === "none") return;
+
+    const signature = getUserTabRenderSignature();
+    if (!options.force && signature === lastUserTabRenderSignature) {
+      refreshUserConfigState(tab);
+      syncTestBankFieldState(tab);
+      return;
+    }
+
+    if (!options.force && isUserTabBusy(tab)) {
+      queueUserTabRender(220, options);
+      return;
+    }
+
     const snapshot = captureUserTabUiState(tab);
     tab.innerHTML = buildUserMarkup();
     bindUserTab(tab);
     restoreUserTabUiState(tab, snapshot);
+    lastUserTabRenderSignature = signature;
   }
 
   function hideUserTab() {
@@ -7904,7 +10924,8 @@ Response: ${snippet}`;
     if (wd) wd.style.display = "none";
     user.style.display = "block";
     activateNav("user");
-    renderUserTabIfVisible();
+    renderUserTabIfVisible({ force: !user.dataset.renderedOnce });
+    user.dataset.renderedOnce = "1";
   }
 
   function bindUserNav(panel) {
@@ -7914,13 +10935,13 @@ Response: ${snippet}`;
     panel.__ppGsUserNavBound = true;
     let userBtn = tabs.querySelector('[data-tab="user"]');
     if (!userBtn) {
-      const legacyUsers = [...tabs.querySelectorAll(".pp-staticNav")].find((el) => /users|menu/i.test(el.textContent || ""));
+      const legacySlot = tabs.querySelector('.pp-staticNav, .pp-nativeNavButton, .pp-navItem');
       userBtn = document.createElement("button");
       userBtn.type = "button";
       userBtn.className = "pp-navItem pp-tabButton";
       userBtn.dataset.tab = "user";
-      userBtn.textContent = "Menu";
-      if (legacyUsers) legacyUsers.replaceWith(userBtn);
+      userBtn.textContent = cleanHeaderText((legacySlot && legacySlot.dataset && legacySlot.dataset.nativeNavText) || (legacySlot && legacySlot.textContent) || "");
+      if (legacySlot) legacySlot.replaceWith(userBtn);
       else tabs.insertBefore(userBtn, tabs.firstChild);
     }
     if (!panel.querySelector("#" + USER_TAB_ID)) {
