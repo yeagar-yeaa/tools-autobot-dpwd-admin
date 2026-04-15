@@ -9554,8 +9554,70 @@ function getDepositExactAmountInput(row, id) {
     return /^(BCA|MANDIRI|BNI|BRI|BSI|CIMB|SEABANK|DANAMON|ANTARBANK|JENIUS|DANA|OVO|GOPAY|LINKAJA|TELKOMSEL|AXIATA|XL)\b/.test(s);
   }
 
+  function extractAccountNameCandidates(value) {
+    const raw = String(value || "").replace(/\s+/g, " ").trim();
+    if (!raw) return [];
+    const out = [];
+    const seen = new Set();
+    const push = (candidate) => {
+      const clean = String(candidate || "").replace(/\s+/g, " ").trim();
+      if (!clean || seen.has(clean)) return;
+      seen.add(clean);
+      out.push(clean);
+    };
+
+    push(raw);
+
+    const slashMatch = raw.match(/^(?:BCA|MANDIRI|BNI|BRI|BSI|CIMB|SEA\s*BANK|SEABANK|DANAMON|ANTAR\s*BANK|ANTARBANK|JENIUS|DANA|OVO|GOPAY|LINK\s*AJA|LINKAJA|TELKOMSEL|AXIATA|XL)\s*[\/|:-]\s*([A-Za-z][A-Za-z .'-]{2,59})$/i);
+    if (slashMatch) push(slashMatch[1]);
+
+    const labelMatch = raw.match(/(?:nama(?:\s+rekening)?|atas\s+nama|account\s*name|account\s*holder|holder\s*name)\s*[:\-]?\s*([A-Za-z][A-Za-z .'-]{2,59})/i);
+    if (labelMatch) push(labelMatch[1]);
+
+    const stripped = raw
+      .replace(/^(?:BCA|MANDIRI|BNI|BRI|BSI|CIMB|SEA\s*BANK|SEABANK|DANAMON|ANTAR\s*BANK|ANTARBANK|JENIUS|DANA|OVO|GOPAY|LINK\s*AJA|LINKAJA|TELKOMSEL|AXIATA|XL)\s*(?:[\/|:-]+|\b)/i, "")
+      .replace(/\b(?:NO(?:MOR)?\s*REK(?:ENING)?|REK(?:ENING)?|ACC(?:OUNT)?|ACCOUNT|A\/C)\b[:\-\s]*/gi, "")
+      .replace(/\b\d{5,}\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (/^[A-Za-z][A-Za-z .'-]{2,59}$/.test(stripped)) push(stripped);
+
+    return out;
+  }
+
+
+  function getWithdrawAccountInfoCell(row) {
+    if (!row) return null;
+    return row.children && row.children[4] ? row.children[4] : row.querySelector("td.form-group") || null;
+  }
+
+  function getWithdrawAccountDisplayName(row, id) {
+    const cell = getWithdrawAccountInfoCell(row);
+    if (!cell) return "";
+    const inputs = [...cell.querySelectorAll("input.form-control[readonly], input[readonly], textarea[readonly]")]
+      .map((el) => String(el.value || el.textContent || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+
+    const blocked = /^(?:\d[\d\s-]{5,}|\(?\d[\d.,]*\)?|click to copy)$/i;
+    const preferred = inputs.find((value) => /[A-Za-z]/.test(value) && !blocked.test(value));
+    if (preferred) return preferred.toUpperCase();
+
+    const texts = collectRowStrings(cell)
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .filter((value) => /[A-Za-z]/.test(value))
+      .filter((value) => !blocked.test(value))
+      .filter((value) => !/^\d{5,}$/.test(value.replace(/\s+/g, "")));
+    return texts[0] ? texts[0].toUpperCase() : "";
+  }
+
   function getExactAccountName(row, username, kind) {
     if (!row) return "";
+
+    if (kind === "withdraw") {
+      const withdrawDisplay = getWithdrawAccountDisplayName(row);
+      if (withdrawDisplay) return withdrawDisplay;
+    }
 
     const blockPattern = /\b(?:bank(?:\s+(?:tujuan|asal))?|rekening\s+(?:tujuan|asal)|asal\s+transfer|tujuan\s+transfer|sumber\s+dana|metode(?:\s+transfer)?|payment|channel)\b/i;
     const goodLabelPattern = /\b(?:nama(?:\s+rekening)?|atas\s+nama|account\s*name|account\s*holder|holder\s*name)\b/i;
@@ -9567,7 +9629,7 @@ function getDepositExactAmountInput(row, id) {
       if (username && txt.toLowerCase() === String(username).toLowerCase()) return true;
       if (!/[A-Za-z]/.test(txt)) return true;
       if (/\d{3,}/.test(txt)) return true;
-      if (txt.length < 3 || txt.length > 60) return true;
+      if (txt.length < 3 || txt.length > 100) return true;
       if (isLikelyAmountText(txt)) return true;
       if (isLikelyBankTargetText(txt)) return true;
       if (blockPattern.test(txt)) return true;
@@ -9610,9 +9672,11 @@ function getDepositExactAmountInput(row, id) {
       ].filter(Boolean);
 
       const context = contexts.join(" | ");
-      const score = rankNameCandidate(value, context);
-      if (!Number.isFinite(score)) return;
-      ranked.push({ value: value.toUpperCase(), score });
+      extractAccountNameCandidates(value).forEach((candidate) => {
+        const score = rankNameCandidate(candidate, context);
+        if (!Number.isFinite(score)) return;
+        ranked.push({ value: candidate.toUpperCase(), score });
+      });
     });
 
     if (ranked.length) {
@@ -9621,9 +9685,9 @@ function getDepositExactAmountInput(row, id) {
     }
 
     const fallbacks = collectRowStrings(row)
-      .map((txt) => normalizeNameCandidate(txt))
+      .flatMap((txt) => extractAccountNameCandidates(normalizeNameCandidate(txt)))
       .filter((txt) => !isBadNameCandidate(txt))
-      .filter((txt) => /^[A-Za-z][A-Za-z .'-]{2,59}$/.test(txt))
+      .filter((txt) => /^[A-Za-z][A-Za-z .'-]{2,99}$/.test(txt))
       .sort((a, b) => b.length - a.length);
 
     return fallbacks[0] ? fallbacks[0].toUpperCase() : "";
@@ -9713,9 +9777,12 @@ function getDepositExactAmountInput(row, id) {
     const row = document.getElementById("withdrawPending-" + id);
     if (!row) return null;
     const username = guessUsername(row, id, "withdraw");
-    const nama = guessName(row, username, "withdraw");
-    const nominal = getNominalFromRow(row, id);
     const sourceKey = getWithdrawSourceKey(row, id);
+    const nama = getWithdrawAccountDisplayName(row, id)
+      || guessName(row, username, "withdraw")
+      || extractAccountNameCandidates(textFromNode(row.children && row.children[4] ? row.children[4] : null))[0]
+      || "";
+    const nominal = getNominalFromRow(row, id);
     const targetCol = pickWithdrawTargetCol(sourceKey);
     if (!nama || !username || !nominal) return null;
     const txKey = "WD-" + id;
